@@ -55,14 +55,10 @@ class LearnableTokens(nn.Module):
             self.emb.copy_(base.unsqueeze(0).repeat(self.cfg.n_tokens, 1))
         else:
             self.emb.normal_(mean=0.0, std=float(self.cfg.init_std))
-
     def forward(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
-
-        emb = self.emb
-        if emb.device != device or emb.dtype != dtype:
-            emb = emb.to(device=device, dtype=dtype)
+        emb = self.emb.to(device=device, dtype=dtype)
         return emb.unsqueeze(0).expand(batch_size, -1, -1)
 
     def save(self, path: str) -> None:

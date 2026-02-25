@@ -105,8 +105,10 @@ class InputBuilder:
 
         position_ids = None
         if self.use_position_ids:
-            position_ids = torch.arange(full_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_v, -1)
-
+        # 动态 position_ids：有效 token 递增，pad 位置保持为 0（由 attention_mask 屏蔽）
+        # position_ids[b, i] = number of non-pad tokens up to i - 1
+            position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0).to(dtype=torch.long)
+        #Pos_new(Text_i)=Pos_old(Text_i)+N_plugin
         meta = {
             "B": batch_v,
             "V": vision_len,
