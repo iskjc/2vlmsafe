@@ -1,0 +1,6 @@
+V: 8
+N: 16
+T: 4
+L_base: 12
+L_plug: 28
+prompt: Describe the image.

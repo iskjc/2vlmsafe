@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import os
@@ -87,7 +87,7 @@ def load_model(
     dtype: torch.dtype,
     device: torch.device,
 ):
-    load_kwargs = {"dtype": dtype}
+    load_kwargs = {"torch_dtype": dtype}
 
     try:
         model = auto_model_cls.from_pretrained(model_name, use_safetensors=True, **load_kwargs)

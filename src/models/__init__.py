@@ -1,4 +1,4 @@
-﻿from .input_builder import BuiltInputs, InputBuilder
+from .input_builder import BuiltInputs, InputBuilder
 from .learnable_tokens import LearnableTokens, LearnableTokensConfig
 from .gate import VisionGate, VisionGateConfig
 from .hook import HookState, ModuleHook

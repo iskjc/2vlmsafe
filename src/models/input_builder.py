@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -106,8 +106,11 @@ class InputBuilder:
         position_ids = None
         attention_mask = torch.cat([vision_mask, plugin_mask, text_attention_mask], dim=1)  # [B, L]
 
+        position_ids = None
         if self.use_position_ids:
-            position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0).long()
+        # 动态 position_ids：对非 padding 位置递增；padding 位置保持为 0（由 attention_mask 屏蔽）
+        # position_ids[b, i] = count(attention_mask[b, :i+1] == 1) - 1
+            position_ids = (attention_mask.cumsum(dim=1) - 1).clamp(min=0).to(dtype=torch.long)
         meta = {
             "B": batch_v,
             "V": vision_len,
@@ -116,8 +119,8 @@ class InputBuilder:
             "L": full_len,
         }
         return BuiltInputs(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            meta=meta,
-        )
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        meta=meta,
+    )

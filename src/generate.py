@@ -1,14 +1,14 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import os
 import random
 import torch
 
-
-from src.models.vision_adapter import LlavaLikeVisionAdapter
-vision_adapter = LlavaLikeVisionAdapter(model).to(device)
-vision_adapter.eval()  # vision tower 冻结
+try:
+    from src.models.vision_adapter import LlavaLikeVisionAdapter
+except ModuleNotFoundError:
+    from models.vision_adapter import LlavaLikeVisionAdapter
 
 try:
     from src.models.learnable_tokens import LearnableTokens, LearnableTokensConfig
@@ -81,13 +81,19 @@ def load_model(
     dtype: torch.dtype,
     device: torch.device,
 ):
-    load_kwargs = {"dtype": dtype}
+    load_kwargs = {}
+    if dtype is not None:
+        load_kwargs = {"torch_dtype": dtype}
 
     try:
         model = auto_model_cls.from_pretrained(model_name, use_safetensors=True, **load_kwargs)
         return model.to(device)
-    except Exception as exc:
-        msg = str(exc)
+    except TypeError:
+        model=auto_model_cls.from_pretrained(model_name, use_safetensors=True)
+    model = model.to(device=device, dtype=dtype)
+    actual_dtype = next(model.parameters()).dtype
+    print(f"Loaded model '{model_name}' with dtype {actual_dtype} on {device}")
+    return model
 
     if _is_missing_safetensors_error(msg):
         try:
@@ -110,7 +116,8 @@ def load_model(
         )
 
     raise SystemExit(f"Failed to load model '{model_name}': {msg}")
-
+    vision_adapter = LlavaLikeVisionAdapter(model).to(device)
+    vision_adapter.eval()  # vision tower 冻结
 
 @torch.no_grad()
 def main() -> None:
@@ -172,7 +179,7 @@ def main() -> None:
 
     vision_embeds = va_out.vision_embeds.to(device=device, dtype=dtype)
     V = vision_embeds.shape[1]  # 真实视觉 token 数
-    
+
     base_builder = InputBuilder(model, plugin_len=0, use_position_ids=True)
     base = base_builder.build(
         vision_embeds=vision_embeds,
@@ -180,6 +187,9 @@ def main() -> None:
         text_input_ids=input_ids,
         text_attention_mask=text.attention_mask,
     )
+    print("[shapes]", base.inputs_embeds.shape, base.attention_mask.shape, base.position_ids.shape)
+    print("[pos head]", base.position_ids[0, :20].tolist())
+    print("[mask head]", base.attention_mask[0, :20].tolist())
     base_out = model.generate(
         inputs_embeds=base.inputs_embeds,
         attention_mask=base.attention_mask,
@@ -190,7 +200,9 @@ def main() -> None:
     base_text = tok.decode(base_out[0], skip_special_tokens=True)
     # 先生成 learnable embeds
     learnable = lt(batch_size, device=device, dtype=dtype)
-
+    if gate is not None:
+        learnable, gate_value = gate.apply_to_embeddings(learnable, vision_embeds)
+    print("[gate]", gate_value.mean().item())
     # 如果使用 gate，则缩放 learnable tokens
     if gate is not None:
         learnable, gate_value = gate.apply_to_embeddings(
@@ -204,6 +216,9 @@ def main() -> None:
         text_input_ids=input_ids,
         text_attention_mask=text.attention_mask,
     )
+    print("[PLUG shapes]", plug.inputs_embeds.shape, plug.attention_mask.shape, plug.position_ids.shape)
+    print("[PLUG pos head]", plug.position_ids[0, :20].tolist())
+    print("[PLUG mask head]", plug.attention_mask[0, :20].tolist())
     plug_out = model.generate(
         inputs_embeds=plug.inputs_embeds,
         attention_mask=plug.attention_mask,
