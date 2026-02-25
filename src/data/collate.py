@@ -4,35 +4,19 @@ import torch
 from .datasets import PromptTargetSample
 
 
+
 def collate_prompt_target_batch(
     batch: Sequence[PromptTargetSample],
     tokenizer: Any,
+    processor: Any | None = None,
     device: torch.device | None = None,
 ) -> Dict[str, Any]:
-    """
-    返回可直接训练的 causal-LM batch：
-      - input_ids: [B, T]
-      - attention_mask: [B, T]
-      - labels: [B, T]（prompt 部分为 -100）
-      - is_harmful: [B]
-      - prompt: add_special_tokens=True（保留 BOS 等）
-      - target: add_special_tokens=False（避免第二个 BOS）
-      - 先拼接，再统一 padding，保证 prompt/target 边界不被 pad 打断
-    """
     if not batch:
         raise ValueError("Batch cannot be empty")
 
     prompts = [item.prompt for item in batch]
     targets = [item.target for item in batch]
     flags = torch.tensor([item.is_harmful for item in batch], dtype=torch.bool)
-
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        # decoder-only 常见：pad_token_id=None，用 eos 兜底
-        pad_id = tokenizer.eos_token_id
-        if pad_id is None:
-            raise ValueError("Tokenizer must define pad_token_id or eos_token_id for batching.")
-
     input_id_list: List[torch.Tensor] = []
     label_list: List[torch.Tensor] = []
     attn_list: List[torch.Tensor] = []
@@ -71,7 +55,19 @@ def collate_prompt_target_batch(
         "raw_prompts": prompts,
         "raw_targets": targets,
     }
+    if processor is not None:
+        images = []
+        for item in batch:
+            if hasattr(item, "image") and item.image is not None:
+                images.append(item.image)
+            elif hasattr(item, "image_path") and item.image_path is not None:
+                from PIL import Image
+                images.append(Image.open(item.image_path).convert("RGB"))
+            else:
+                raise ValueError("Sample must have `image` or `image_path` when processor is provided.")
 
+        pv = processor(images=images, return_tensors="pt")["pixel_values"]  # [B, C, H, W]
+        out["pixel_values"] = pv
     if device is not None:
         for key, value in list(out.items()):
             if torch.is_tensor(value):

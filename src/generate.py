@@ -2,8 +2,13 @@
 
 import argparse
 import os
-
+import random
 import torch
+
+
+from src.models.vision_adapter import LlavaLikeVisionAdapter
+vision_adapter = LlavaLikeVisionAdapter(model).to(device)
+vision_adapter.eval()  # vision tower 冻结
 
 try:
     from src.models.learnable_tokens import LearnableTokens, LearnableTokensConfig
@@ -13,6 +18,9 @@ except ModuleNotFoundError:
     from models.learnable_tokens import LearnableTokens, LearnableTokensConfig
     from models.input_builder import InputBuilder
 
+random.seed(0)
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
 
 def import_transformers():
     try:
@@ -135,9 +143,8 @@ def main() -> None:
 
     hidden = model.config.hidden_size
 
-    lt = LearnableTokens(LearnableTokensConfig(n_tokens=args.n_plugin, hidden_size=hidden)).to(device)
+    lt = LearnableTokens(LearnableTokensConfig(n_tokens=args.n_plugin, hidden_size=hidden)).to(device=device, dtype=dtype)
     lt.load(args.ckpt, map_location=device)
-    gate = None
     if args.use_gate:
         if not args.gate_ckpt or not os.path.exists(args.gate_ckpt):
             raise SystemExit("When --use_gate, you must provide --gate_ckpt")
@@ -145,20 +152,27 @@ def main() -> None:
             from src.models.gate import VisionGate, VisionGateConfig
         except ModuleNotFoundError:
             from models.gate import VisionGate, VisionGateConfig
-        gate = VisionGate(VisionGateConfig(input_size=hidden, hidden_size=256)).to(device)
+        gate = VisionGate(VisionGateConfig(input_size=hidden, hidden_size=256)).to(device=device, dtype=dtype)
         ckpt = torch.load(args.gate_ckpt, map_location=device)
         gate.load_state_dict(ckpt["state_dict"])
         gate.eval()
 
     builder = InputBuilder(model, plugin_len=args.n_plugin, use_position_ids=True)
 
-    text = tok(args.prompt, return_tensors="pt").to(device)
+    text = tok(args.prompt, return_tensors="pt").to(device=device)
     input_ids = text.input_ids
     batch_size, _ = input_ids.shape
 
-    vision_tokens = 8
-    vision_embeds = torch.zeros((batch_size, vision_tokens, hidden), device=device, dtype=dtype)
+    pixel_values = batch["pixel_values"]  # [B, C, H, W]
 
+    va_out = vision_adapter.encode(
+        pixel_values,
+        dtype=dtype,
+    )
+
+    vision_embeds = va_out.vision_embeds.to(device=device, dtype=dtype)
+    V = vision_embeds.shape[1]  # 真实视觉 token 数
+    
     base_builder = InputBuilder(model, plugin_len=0, use_position_ids=True)
     base = base_builder.build(
         vision_embeds=vision_embeds,
@@ -195,7 +209,12 @@ def main() -> None:
         attention_mask=plug.attention_mask,
         position_ids=plug.position_ids,
         max_new_tokens=args.max_new_tokens,
-        do_sample=False,
+        do_sample=True,
+        temperature=0.9,
+        top_p=0.9,
+        repetition_penalty=1.15,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id
     )
     plug_text = tok.decode(plug_out[0], skip_special_tokens=True)
 

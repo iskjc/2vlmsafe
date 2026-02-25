@@ -6,6 +6,9 @@ import os
 import torch
 import torch.nn as nn
 
+from transformers import AutoProcessor
+processor = AutoProcessor.from_pretrained(args.model_name)
+
 try:
     from src.models.learnable_tokens import LearnableTokens, LearnableTokensConfig
     from src.models.input_builder import InputBuilder
@@ -14,7 +17,11 @@ except ModuleNotFoundError:
     from models.learnable_tokens import LearnableTokens, LearnableTokensConfig
     from models.input_builder import InputBuilder
 
-
+from .datasets import build_toy_dataset, build_jsonl_dataset
+if args.data_path:
+    dataset = build_jsonl_dataset(args.data_path)
+else:
+    dataset = build_toy_dataset()
 def freeze_model(model: nn.Module) -> None:
     for p in model.parameters():
         p.requires_grad = False
@@ -121,30 +128,27 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16", "fp32"])
 
-    # 插件与训练超参
+    # plug与训练超参
     ap.add_argument("--n_plugin", type=int, default=16)
     ap.add_argument("--lr", type=float, default=5e-3)
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_clip", type=float, default=1.0)
-
-    # Loss 权重
+    # Loss
     ap.add_argument("--lambda_safe", type=float, default=1.0)
     ap.add_argument("--lambda_util", type=float, default=1.0)
     ap.add_argument("--lambda_gate", type=float, default=0.2)
-
-    # Gate（门控）
+    # Gate
     ap.add_argument("--use_gate", action="store_true")
     ap.add_argument("--gate_hidden", type=int, default=256)
-
     # 视觉 token（暂时用占位；接真 VLM 时替换 vision_embeds 构造）
     ap.add_argument("--vision_tokens", type=int, default=8)
-
     # 仅用于 toy 数据演示 gate：给 harmful/benign 注入不同强度噪声，使 gate 有可学信号
     ap.add_argument("--toy_vision_signal", action="store_true")
-
     ap.add_argument("--save_path", type=str, default="outputs/learnable_tokens.pt")
     ap.add_argument("--save_gate_path", type=str, default="outputs/gate.pt")
+    ap.add_argument("--data_path", type=str, default="", help="Path to training data jsonl")
+    ap.add_argument("--toy", action="store_true")#暂时保留
     args = ap.parse_args()
 
     if args.n_plugin <= 0:
@@ -209,7 +213,7 @@ def main() -> None:
         ds,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda b: collate_prompt_target_batch(b, tok, device=device),
+        collate_fn=lambda b: collate_prompt_target_batch(b, tok, processor=processor, device=device),
         drop_last=False,
     )
 
@@ -240,7 +244,9 @@ def main() -> None:
         B, T = input_ids.shape
 
         # ----- 构造 vision_embeds（占位：接真 VLM 后用真实视觉特征替换） -----
-        V = int(args.vision_tokens)
+        V = vision_embeds.shape[1]
+        print("vision_embeds:", vision_embeds.shape)
+        print("hidden size:", hidden_size)
         if V > 0:
             vision_embeds = torch.zeros((B, V, hidden_size), device=device, dtype=dtype)
             if args.toy_vision_signal:
@@ -297,7 +303,7 @@ def main() -> None:
         else:
             loss_safe = torch.zeros((), device=device,dtype=dtype)
 
-        # ----- Utility Loss：只在 benign 样本上做 KL(p_base || p_plugin) -----
+        # Utility Loss：只在 benign 样本上做 KL(p_base || p_plugin)
         # baseline forward（N=0），注意对齐到 text 区间
         base = base_builder.build(
             vision_embeds=vision_embeds,

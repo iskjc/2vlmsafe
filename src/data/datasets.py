@@ -4,13 +4,16 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 from torch.utils.data import Dataset
-
+import json
+from pathlib import Path
 
 @dataclass(frozen=True)
 class PromptTargetSample:
     prompt: str
     target: str
     is_harmful: bool
+    image_path: str | None = None
+
 
 
 class PromptTargetDataset(Dataset[PromptTargetSample]):
@@ -22,10 +25,8 @@ class PromptTargetDataset(Dataset[PromptTargetSample]):
             if isinstance(item, PromptTargetSample):
                 normalized.append(item)
                 continue
-
             if not isinstance(item, Mapping):
                 raise TypeError(f"Unsupported sample type: {type(item)}")
-
             prompt = item.get("prompt")
             target = item.get("target")
             is_harmful = item.get("is_harmful", False)
@@ -38,10 +39,8 @@ class PromptTargetDataset(Dataset[PromptTargetSample]):
                     is_harmful=bool(is_harmful),
                 )
             )
-
         if not normalized:
             raise ValueError("Dataset cannot be empty")
-
         self.samples = normalized
 
     def __len__(self) -> int:
@@ -50,8 +49,22 @@ class PromptTargetDataset(Dataset[PromptTargetSample]):
     def __getitem__(self, idx: int) -> PromptTargetSample:
         return self.samples[idx]
 
+def build_jsonl_dataset(path: str) -> PromptTargetDataset:
+    path = Path(path)
+    items = []
+    with path.open("r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            assert "prompt" in obj and "target" in obj and "is_harmful" in obj, f"Missing keys at line {lineno}"
+            assert isinstance(obj["is_harmful"], bool), f"is_harmful must be bool at line {lineno}"
+            items.append(obj)
+    return PromptTargetDataset(items)
 
-def build_toy_dataset() -> PromptTargetDataset:
+#暂时保留
+def build_toy_dataset() -> PromptTargetDataset: 
     return PromptTargetDataset(
         [
             {
@@ -66,3 +79,8 @@ def build_toy_dataset() -> PromptTargetDataset:
             },
         ]
     )
+
+def build_dataset(data_path: str = "", toy: bool = False) -> PromptTargetDataset:
+    if toy or (not data_path):
+        return build_toy_dataset()
+    return build_jsonl_dataset(data_path)
