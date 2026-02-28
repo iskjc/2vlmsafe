@@ -1,1 +1,55 @@
-data/vlguard/raw/*.zip
+# --------------------
+# Data (datasets)
+# --------------------
+data/vlguard/raw/
+data/vlguard/images/
+data/vlguard/processed/
+
+data/coco/raw/
+data/coco/images/
+data/coco/processed/
+
+# 如果你以后加别的数据集
+data/*/raw/
+data/*/images/
+data/*/processed/
+
+# --------------------
+# Model checkpoints
+# --------------------
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# --------------------
+# Logs
+# --------------------
+logs/
+*.log
+runs/
+tensorboard/
+
+# --------------------
+# Python cache
+# --------------------
+__pycache__/
+*.pyc
+*.pyo
+
+# --------------------
+# Jupyter
+# --------------------
+.ipynb_checkpoints/
+
+# --------------------
+# VSCode
+# --------------------
+.vscode/
+
+# --------------------
+# OS
+# --------------------
+.DS_Store
+Thumbs.db

@@ -1,4 +1,3 @@
-# data_build/build_vlguard.py
 from __future__ import annotations
 
 import json
@@ -75,49 +74,82 @@ def main():
     out_dir = ensure_dir(vlroot / "processed")
     out_jsonl = out_dir / "vlguard_train.jsonl"
 
-    # 1) 下载 train.json / train.zip 到 raw_dir
-    try:
-        from huggingface_hub import snapshot_download
-    except Exception as e:
-        raise SystemExit("缺 huggingface_hub：pip install -U huggingface_hub") from e
+    # -------------------------
+    # [1/4] 获取 train.json / train.zip：优先用 raw_dir；没有才下载（HuggingFace）
+    # -------------------------
+    train_json = raw_dir / "train.json"
+    train_zip = raw_dir / "train.zip"
 
-    print("[1/4] snapshot_download VLGuard ...")
-    snap_path = Path(
-        snapshot_download(
-            repo_id="ys-zong/VLGuard",
-            repo_type="dataset",
-            local_dir=str(raw_dir),
-            local_dir_use_symlinks=False,  # Windows 更稳
-            allow_patterns=["train.json", "train.zip", "test.json", "test.zip"],
+    if train_json.exists() and train_zip.exists():
+        print("[1/4] use existing files in raw_dir")
+        snap_path = None
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as e:
+            raise SystemExit("缺 huggingface_hub：pip install -U huggingface_hub") from e
+
+        print("[1/4] snapshot_download VLGuard ...")
+        snap_path = Path(
+            snapshot_download(
+                repo_id="ys-zong/VLGuard",
+                repo_type="dataset",
+                local_dir=str(raw_dir),
+                local_dir_use_symlinks=False,  # Windows 更稳
+                allow_patterns=["train.json", "train.zip", "test.json", "test.zip"],
+            )
         )
-    )
+        train_json = first_existing([raw_dir / "train.json", snap_path / "train.json"]) or train_json
+        train_zip = first_existing([raw_dir / "train.zip", snap_path / "train.zip"]) or train_zip
 
-    train_json = first_existing([raw_dir / "train.json", snap_path / "train.json"])
-    train_zip  = first_existing([raw_dir / "train.zip",  snap_path / "train.zip"])
-
-    if train_json is None or train_zip is None:
-        raise SystemExit(f"没找到 train.json/train.zip。raw_dir={raw_dir}, snap_path={snap_path}")
+    if not train_json.exists() or not train_zip.exists():
+        raise SystemExit(f"没找到 train.json/train.zip：train_json={train_json}, train_zip={train_zip}")
 
     print("train_json:", train_json)
     print("train_zip :", train_zip)
 
-    # 2) 解压图片到 img_dir/train
-    train_img_root = img_dir / "train"
-    print("[2/4] unzip train.zip ->", train_img_root)
-    unzip_if_needed(train_zip, train_img_root)
+    # -------------------------
+    # [2/4] 解压 train.zip 到 images
+    #   - zip 里通常自带 train/xxx.jpg
+    #   - 我们先解压到 images/，再把 images/train/* 扁平化搬到 images/*
+    # -------------------------
+    print("[2/4] unzip train.zip ->", img_dir)
+    unzip_if_needed(train_zip, img_dir)
 
-    # 3) 解析 train.json，生成统一格式 jsonl
+    # 若解压后出现 images/train/...，则把 train 下的类别目录搬到 images 根目录
+    train_folder = img_dir / "train"
+    if train_folder.exists() and train_folder.is_dir():
+        # 如果 images 根目录下已经有 jpg/类别目录，就不动；否则搬运
+        root_has_images = any(p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} for p in img_dir.rglob("*.*"))
+        # root_has_images 可能被 train/ 内部触发，这里再判断根目录是否已有类别文件夹
+        root_has_category_dirs = any((p.is_dir() and p.name != "train") for p in img_dir.iterdir())
+
+        if not root_has_category_dirs:
+            import shutil
+            for child in train_folder.iterdir():
+                dst = img_dir / child.name
+                if dst.exists():
+                    continue
+                shutil.move(str(child), str(dst))
+            # 尝试删除空的 train 目录
+            try:
+                train_folder.rmdir()
+            except OSError:
+                pass
+
+    # 选择真正的图片根：优先 images/，如果没有再退到 images/train
+    img_root = img_dir
+    if not any(img_root.rglob("*.jpg")) and (img_dir / "train").exists():
+        img_root = img_dir / "train"
+
+    print("image_root:", img_root)
+
+    # -------------------------
+    # [3/4] 解析 train.json -> jsonl（JSON Lines）
+    # -------------------------
     print("[3/4] parse train.json -> jsonl")
     data = read_json(train_json)
 
-    # VLGuard 里你日志显示有字段：
-    # id, image, safe(bool), harmful_category, harmful_subcategory, instr-resp(list of structs)
-    # 其中 instr-resp 每个 item 可能有 instruction/response/safe_instruction/unsafe_instruction
-    # 我们策略：
-    # - 每个 instr-resp item 生成一条样本
-    # - is_harmful = not safe
-    # - prompt 优先用 unsafe_instruction / safe_instruction；退化用 instruction
-    # - target 优先用 response；没有就空字符串
     n_written = 0
     n_missing_img = 0
     n_missing_instr = 0
@@ -132,13 +164,13 @@ def main():
                 n_missing_img += 1
                 continue
 
-            img_path = resolve_image(train_img_root, img_field)
+            img_path = resolve_image(img_root, img_field)
             if img_path is None:
                 n_missing_img += 1
                 continue
 
             if safe_flag is None:
-                # 没 safe 字段就跳过（你也可以设默认 False）
+                # 没 safe 字段就跳过（你也可以改成默认 False）
                 continue
 
             is_harmful = (not safe_flag)
@@ -151,7 +183,6 @@ def main():
                 if not isinstance(item, dict):
                     continue
 
-                prompt = None
                 if is_harmful:
                     prompt = item.get("unsafe_instruction") or item.get("instruction")
                 else:
@@ -169,7 +200,6 @@ def main():
                     "target": target,
                     "is_harmful": bool(is_harmful),
                     "image": str(img_path),
-                    # 额外信息可留着以后分析
                     "harmful_category": ex.get("harmful_category", ""),
                     "harmful_subcategory": ex.get("harmful_subcategory", ""),
                     "vlguard_id": ex.get("id", ""),
@@ -177,11 +207,15 @@ def main():
                 w.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 n_written += 1
 
+    # -------------------------
+    # [4/4] 汇总输出
+    # -------------------------
     print("[4/4] done")
     print("output:", out_jsonl)
     print("written:", n_written)
     print("missing_img_skipped:", n_missing_img)
     print("missing_instr_skipped:", n_missing_instr)
+   
 
 if __name__ == "__main__":
     main()
