@@ -1,9 +1,10 @@
 from __future__ import annotations
+
 from typing import Any, Dict, Sequence, List
+from pathlib import Path
+
 import torch
 from .datasets import PromptTargetSample
-
-
 
 def collate_prompt_target_batch(
     batch: Sequence[PromptTargetSample],
@@ -13,63 +14,70 @@ def collate_prompt_target_batch(
 ) -> Dict[str, Any]:
     if not batch:
         raise ValueError("Batch cannot be empty")
+    if processor is None:
+        raise ValueError("Qwen2-VL requires a processor to handle dynamic image tokens.")
 
-    prompts = [item.prompt for item in batch]
-    targets = [item.target for item in batch]
-    flags = torch.tensor([item.is_harmful for item in batch], dtype=torch.bool)
-    input_id_list: List[torch.Tensor] = []
-    label_list: List[torch.Tensor] = []
-    attn_list: List[torch.Tensor] = []
-    prompt_lens: List[int] = []
+    from PIL import Image
+    
+    # 1. 准备图片和构建对话文本
+    images = []
+    full_texts = []
+    prompt_texts = []
 
-    for p, t in zip(prompts, targets):
-        p_ids = tokenizer(p, add_special_tokens=True, return_tensors="pt").input_ids[0]
-        t_ids = tokenizer(t, add_special_tokens=False, return_tensors="pt").input_ids[0]
+    for item in batch:
+        img_val = getattr(item, "image_path", None) or getattr(item, "image", None)
 
-        ids = torch.cat([p_ids, t_ids], dim=0)
-        labels = torch.cat([torch.full_like(p_ids, -100), t_ids], dim=0)
+        if img_val is None:
+            raise AttributeError(f"Sample object has no image_path or image attribute: {item}")
+        img_path = Path(img_val)
 
-        input_id_list.append(ids)
-        label_list.append(labels)
-        attn_list.append(torch.ones_like(ids, dtype=torch.long))
-        prompt_lens.append(int(p_ids.numel()))
+        if not img_path.exists():
+            raise FileNotFoundError(f"Image not found at: {img_path}")
+        images.append(Image.open(img_path).convert("RGB"))
 
-    max_len = max(int(x.numel()) for x in input_id_list)
+        # 构造完整对话 (用于生成 input_ids)
+        # 注意：Qwen2-VL 的模板非常关键
+        p_text = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{item.prompt}<|im_end|>\n<|im_start|>assistant\n"
+        t_text = f"{item.target}<|im_end|>"
+        full_texts.append(p_text + t_text)
+        prompt_texts.append(p_text)
 
-    def _pad_1d(x: torch.Tensor, pad_value: int) -> torch.Tensor:
-        if x.numel() == max_len:
-            return x
-        pad = torch.full((max_len - x.numel(),), pad_value, dtype=x.dtype)
-        return torch.cat([x, pad], dim=0)
+    # 2. 调用 Processor 处理所有数据
+    batch_data = processor(
+        text=full_texts,
+        images=images,
+        return_tensors="pt",
+        padding=True
+    )
+    
+    # 3. 计算 Labels (掩盖 Prompt 部分的 Loss)
+    # 再把只含 Prompt 的文本处理一遍，以此确定每个 sample 中 Prompt 占据的 token 长度
+    prompt_data = processor(
+        text=prompt_texts,
+        images=images,
+        return_tensors="pt",
+        padding=True
+    )
+    
+    input_ids = batch_data["input_ids"]
+    labels = input_ids.clone()
+    
+    # 将 Prompt 对应的部分全部设为 -100
+    for i in range(len(batch)):
+        # 找到 prompt 的长度（注意：processor 返回的是补齐后的，这里需要通过 attention_mask 算实际长度）
+        p_len = prompt_data["attention_mask"][i].sum().item()
+        labels[i, :p_len] = -100
 
-    input_ids = torch.stack([_pad_1d(x, int(pad_id)) for x in input_id_list], dim=0)
-    labels = torch.stack([_pad_1d(x, -100) for x in label_list], dim=0)
-    attention_mask = torch.stack([_pad_1d(x, 0) for x in attn_list], dim=0)
-
-    out: Dict[str, Any] = {
+    out = {
         "input_ids": input_ids,
-        "attention_mask": attention_mask,
+        "attention_mask": batch_data["attention_mask"],
         "labels": labels,
-        "is_harmful": flags,
-        "prompt_lens": torch.tensor(prompt_lens, dtype=torch.long),
-        "raw_prompts": prompts,
-        "raw_targets": targets,
+        "pixel_values": batch_data["pixel_values"],
+        "image_grid_thw": batch_data.get("image_grid_thw"), # Qwen2-VL 特有
+        "is_harmful": torch.tensor([item.is_harmful for item in batch], dtype=torch.bool),
     }
-    if processor is not None:
-        images = []
-        for item in batch:
-            if hasattr(item, "image") and item.image is not None:
-                images.append(item.image)
-            elif hasattr(item, "image_path") and item.image_path is not None:
-                from PIL import Image
-                images.append(Image.open(item.image_path).convert("RGB"))
-            else:
-                raise ValueError("Sample must have `image` or `image_path` when processor is provided.")
 
-        pv = processor(images=images, return_tensors="pt")["pixel_values"]  # [B, C, H, W]
-        out["pixel_values"] = pv
     if device is not None:
-        for key, value in list(out.items()):
-            if torch.is_tensor(value):
-                out[key] = value.to(device)
+        out = {k: v.to(device) if torch.is_tensor(v) else v for k, v in out.items()}
+
     return out

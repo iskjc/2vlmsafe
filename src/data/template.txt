@@ -1,0 +1,26 @@
+
+ A：从 jailbreak templates 采样，不配图
+ B：benign image × jailbreak template
+ C：danger image × benign template
+ D：danger image × jailbreak template
+
+condition：A/B/C/D
+
+image_type：benign / dangerous
+
+prompt_type：benign / jailbreak
+
+attack_type：上面 5 类之一
+harm_category：violence/ drugs/ weapons/ illegal/ hate/ sexual等
+
+is_harmful：true/false
+
+target：先用 "REFUSE" 占位
+
+
+
+写 prompt 模板库
+
+benign templates：~40 个
+
+jailbreak templates：~80 个（5 种 attack_type 各 16 个）

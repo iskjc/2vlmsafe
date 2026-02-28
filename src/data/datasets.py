@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence, Optional
 
 from torch.utils.data import Dataset
 import json
@@ -12,7 +12,7 @@ class PromptTargetSample:
     prompt: str
     target: str
     is_harmful: bool
-    image_path: str | None = None
+    image_path: Optional[str] = None
 
 
 
@@ -30,13 +30,25 @@ class PromptTargetDataset(Dataset[PromptTargetSample]):
             prompt = item.get("prompt")
             target = item.get("target")
             is_harmful = item.get("is_harmful", False)
+            image=item.get("image")
             if not isinstance(prompt, str) or not isinstance(target, str):
                 raise ValueError(f"Invalid sample fields: {item}")
+
+            img_str:Optional[str]=None
+            if image is not None:
+                if not isinstance(image, str):
+                    raise ValueError(f"image must be str if provided: {item}")
+                img_path=Path(image)
+                if not img_path.exists():
+                    raise ValueError(f"Image not found: {img_path}")
+                img_str=str(img_path)
+
             normalized.append(
                 PromptTargetSample(
                     prompt=prompt,
                     target=target,
                     is_harmful=bool(is_harmful),
+                    image_path=img_str
                 )
             )
         if not normalized:
@@ -57,9 +69,23 @@ def build_jsonl_dataset(path: str) -> PromptTargetDataset:
             line = line.strip()
             if not line:
                 continue
+
             obj = json.loads(line)
-            assert "prompt" in obj and "target" in obj and "is_harmful" in obj, f"Missing keys at line {lineno}"
+
+            need = {"prompt", "target", "is_harmful", "image"}
+            missing = need.difference(obj.keys())
+            assert not missing, f"Missing keys {missing} at line {lineno}"
+
             assert isinstance(obj["is_harmful"], bool), f"is_harmful must be bool at line {lineno}"
+            assert isinstance(obj["prompt"], str), f"prompt must be str at line {lineno}"
+            assert isinstance(obj["target"], str), f"target must be str at line {lineno}"
+            assert isinstance(obj["image"], str), f"image must be str at line {lineno}"
+
+            img_path = Path(obj["image"])
+            if not img_path.is_absolute():
+                img_path = (path.parent / img_path).resolve()
+            assert img_path.exists(), f"Image not found: {img_path} at line {lineno}"
+            obj["image"] = str(img_path)
             items.append(obj)
     return PromptTargetDataset(items)
 
