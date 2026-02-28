@@ -29,7 +29,12 @@ def freeze_model(model: nn.Module) -> None:
 
 def import_transformers():
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoTokenizer,
+        )
     except Exception as exc:  # pragma: no cover - environment-specific
         msg = str(exc)
         hint = ""
@@ -40,7 +45,16 @@ def import_transformers():
                 "`pip install --upgrade --force-reinstall numpy scikit-learn`."
             )
         raise SystemExit(f"Failed to import transformers: {msg}.{hint}")
-    return AutoTokenizer, AutoModelForCausalLM
+    return AutoTokenizer, AutoModelForCausalLM, AutoModelForImageTextToText, AutoConfig
+
+
+def select_model_class(model_name: str, auto_config_cls, causal_cls, vl_cls):
+    # FIX(local): use VL model class for Qwen2.5-VL configs.
+    cfg = auto_config_cls.from_pretrained(model_name, trust_remote_code=True)
+    cfg_name = type(cfg).__name__.lower()
+    if "vl" in cfg_name:
+        return vl_cls
+    return causal_cls
 
 
 def resolve_device_and_dtype(device_name: str, dtype_name: str) -> tuple[torch.device, torch.dtype]:
@@ -118,7 +132,6 @@ def load_model(
 
 
 def main() -> None:
-    import math
     import torch.nn.functional as F
     from torch.utils.data import DataLoader
 
@@ -150,7 +163,8 @@ def main() -> None:
     ap.add_argument("--toy", action="store_true")#暂时保留
     args = ap.parse_args()
 
-    processor = AutoProcessor.from_pretrained(args.model_name)
+    # FIX(local): ensure processor works with remote-code VLM checkpoints.
+    processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
 
     if args.n_plugin <= 0:
         raise SystemExit("--n_plugin must be > 0")
@@ -161,11 +175,17 @@ def main() -> None:
     if args.vision_tokens < 0:
         raise SystemExit("--vision_tokens must be >= 0")
 
-    AutoTokenizer, AutoModelForCausalLM = import_transformers()
+    AutoTokenizer, AutoModelForCausalLM, AutoModelForImageTextToText, AutoConfig = import_transformers()
     device, dtype = resolve_device_and_dtype(args.device, args.dtype)
 
     tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True, trust_remote_code=True)
-    model = load_model(AutoModelForCausalLM, args.model_name, dtype=dtype, device=device)
+    model_cls = select_model_class(
+        args.model_name,
+        auto_config_cls=AutoConfig,
+        causal_cls=AutoModelForCausalLM,
+        vl_cls=AutoModelForImageTextToText,
+    )
+    model = load_model(model_cls, args.model_name, dtype=dtype, device=device)
     freeze_model(model)
 
     hidden_size = model.config.hidden_size
@@ -203,10 +223,8 @@ def main() -> None:
 
     # Dataset / Loader（目前用 toy， 后面接真实 jailbreak/VQA 只要替换 build_dataset）
     try:
-        from src.data.datasets import build_toy_dataset
         from src.data.collate import collate_prompt_target_batch
     except ModuleNotFoundError:
-        from data.datasets import build_toy_dataset
         from data.collate import collate_prompt_target_batch
 
     if args.data_path:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence, Optional
+from typing import Iterable, Mapping, Optional
 
 from torch.utils.data import Dataset
 import json
@@ -83,10 +83,8 @@ def build_jsonl_dataset(path: str) -> PromptTargetDataset:
             img = obj.get("image", None)
             if img is not None:
                 assert isinstance(img, str), f"image must be str or None at line {lineno}"
-                img_path = Path(img)
-            else:
-                img_path = None
-            items.append(items)
+            # FIX(local): append parsed object instead of appending the list itself.
+            items.append(obj)
     return PromptTargetDataset(items)
 
 #暂时保留

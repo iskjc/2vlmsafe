@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from .base import VLMAdapter
 from .generic_hf import GenericHFAdapter, GenericTemplate
@@ -37,7 +37,8 @@ class Qwen2VLAdapter(GenericHFAdapter):
 def get_adapter(model_name: str, processor: Any, tokenizer: Any = None) -> VLMAdapter:
     name = (model_name or "").lower()
 
-    if "qwen2-vl" in name:
+    # FIX(local): Qwen2.5-VL model names do not contain "qwen2-vl".
+    if "qwen2-vl" in name or "qwen2.5-vl" in name:
         return Qwen2VLAdapter(processor=processor, tokenizer=tokenizer)
 
     # 其他模型：先用通用 HF adapter

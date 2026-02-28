@@ -6,7 +6,11 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from PIL import Image
 
-from src.models.adapters.registry import get_adapter
+try:
+    from src.models.adapters.registry import get_adapter
+except ModuleNotFoundError:
+    # FIX(local): allow direct execution paths where package prefix `src.` is unavailable.
+    from models.adapters.registry import get_adapter
 
 
 def collate_unified(
@@ -85,3 +89,30 @@ def collate_unified(
         out = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in out.items()}
 
     return out
+
+
+def collate_prompt_target_batch(
+    batch: Sequence[Any],
+    tokenizer: Any = None,
+    processor: Any = None,
+    model_name: str = "",
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    # FIX(local): keep backward-compatible API used by train/data_build scripts.
+    # Some callers pass tokenizer positionally, others by keyword.
+    if processor is None:
+        raise ValueError("processor must not be None")
+    if not model_name:
+        # FIX(local): infer model name for legacy callers that do not pass model_name.
+        model_name = (
+            getattr(processor, "name_or_path", "")
+            or getattr(tokenizer, "name_or_path", "")
+            or ""
+        )
+    return collate_unified(
+        batch=batch,
+        processor=processor,
+        model_name=model_name,
+        device=device,
+        tokenizer=tokenizer,
+    )

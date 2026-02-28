@@ -7,11 +7,16 @@ import numpy as np
 import torch
 
 try:
-    from src.generate import import_transformers, load_model, resolve_device_and_dtype
+    from src.generate import (
+        import_transformers,
+        load_model,
+        resolve_device_and_dtype,
+        select_model_class,
+    )
     from src.models.input_builder import InputBuilder
     from src.models.learnable_tokens import LearnableTokens, LearnableTokensConfig
 except ModuleNotFoundError:
-    from generate import import_transformers, load_model, resolve_device_and_dtype
+    from generate import import_transformers, load_model, resolve_device_and_dtype, select_model_class
     from models.input_builder import InputBuilder
     from models.learnable_tokens import LearnableTokens, LearnableTokensConfig
 
@@ -67,11 +72,19 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=1)
     args = ap.parse_args()
 
-    AutoTokenizer, AutoModelForCausalLM = import_transformers()
+    AutoTokenizer, AutoModelForCausalLM, AutoModelForImageTextToText, AutoConfig = import_transformers()
     device, dtype = resolve_device_and_dtype(args.device, args.dtype)
 
-    tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    model = load_model_for_attention(AutoModelForCausalLM, args.model_name, dtype=dtype, device=device)
+    # FIX(local): keep tokenizer loading consistent for VLM checkpoints.
+    tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True, trust_remote_code=True)
+    model_cls = select_model_class(
+        args.model_name,
+        auto_config_cls=AutoConfig,
+        causal_cls=AutoModelForCausalLM,
+        vl_cls=AutoModelForImageTextToText,
+    )
+    # FIX(local): select VL-capable model class when needed.
+    model = load_model_for_attention(model_cls, args.model_name, dtype=dtype, device=device)
     model.config.output_attentions = True
     model.eval()
 
