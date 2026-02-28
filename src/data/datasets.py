@@ -72,21 +72,21 @@ def build_jsonl_dataset(path: str) -> PromptTargetDataset:
 
             obj = json.loads(line)
 
-            need = {"prompt", "target", "is_harmful", "image"}
+            need = {"prompt", "target", "is_harmful"}
             missing = need.difference(obj.keys())
             assert not missing, f"Missing keys {missing} at line {lineno}"
 
             assert isinstance(obj["is_harmful"], bool), f"is_harmful must be bool at line {lineno}"
             assert isinstance(obj["prompt"], str), f"prompt must be str at line {lineno}"
             assert isinstance(obj["target"], str), f"target must be str at line {lineno}"
-            assert isinstance(obj["image"], str), f"image must be str at line {lineno}"
 
-            img_path = Path(obj["image"])
-            if not img_path.is_absolute():
-                img_path = (path.parent / img_path).resolve()
-            assert img_path.exists(), f"Image not found: {img_path} at line {lineno}"
-            obj["image"] = str(img_path)
-            items.append(obj)
+            img = obj.get("image", None)
+            if img is not None:
+                assert isinstance(img, str), f"image must be str or None at line {lineno}"
+                img_path = Path(img)
+            else:
+                img_path = None
+            items.append(items)
     return PromptTargetDataset(items)
 
 #暂时保留

@@ -164,7 +164,7 @@ def main() -> None:
     AutoTokenizer, AutoModelForCausalLM = import_transformers()
     device, dtype = resolve_device_and_dtype(args.device, args.dtype)
 
-    tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True, trust_remote_code=True)
     model = load_model(AutoModelForCausalLM, args.model_name, dtype=dtype, device=device)
     freeze_model(model)
 
@@ -218,7 +218,7 @@ def main() -> None:
         ds,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda b: collate_prompt_target_batch(b, tok, processor=processor, device=device),
+        collate_fn=lambda b: collate_prompt_target_batch(b, processor=processor,model_name=args.model_name, device=device,tokenizer=tok),
         drop_last=False,
     )
 

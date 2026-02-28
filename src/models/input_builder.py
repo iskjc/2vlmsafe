@@ -102,11 +102,8 @@ class InputBuilder:
         vision_mask = torch.ones((batch_v, vision_len), device=device, dtype=torch.long)
         plugin_mask = torch.ones((batch_v, plugin_len), device=device, dtype=torch.long)
         attention_mask = torch.cat([vision_mask, plugin_mask, text_attention_mask], dim=1)
-
         position_ids = None
-        attention_mask = torch.cat([vision_mask, plugin_mask, text_attention_mask], dim=1)  # [B, L]
 
-        position_ids = None
         if self.use_position_ids:
         # 动态 position_ids：对非 padding 位置递增；padding 位置保持为 0（由 attention_mask 屏蔽）
         # position_ids[b, i] = count(attention_mask[b, :i+1] == 1) - 1
