@@ -290,7 +290,27 @@ def main() -> None:
         # ----- 构造 vision_embeds（占位：接真 VLM 后用真实视觉特征替换） -----
         V = args.vision_tokens
         if V > 0:
-            vision_embeds = torch.zeros((B, V, hidden_size), device=device, dtype=dtype)
+            # 用真实视觉特征替换占位 zeros
+            if "pixel_values" in batch and "image_grid_thw" in batch and hasattr(model, "get_image_features"):
+                with torch.no_grad():
+                    feats = model.get_image_features(
+                        batch["pixel_values"].to(device=device),
+                        batch["image_grid_thw"].to(device=device),
+                    )  # tuple/list, each [V_i, H]
+
+                Vmax = max(x.shape[0] for x in feats)
+                vision_embeds = torch.zeros((B, Vmax, hidden_size), device=device, dtype=dtype)
+                vision_mask = torch.zeros((B, Vmax), device=device, dtype=torch.long)
+                for i, x in enumerate(feats):
+                    v = x.shape[0]
+                    vision_embeds[i, :v] = x.to(device=device, dtype=dtype)
+                    vision_mask[i, :v] = 1
+            else:
+                vision_embeds = torch.zeros((B, 0, hidden_size), device=device, dtype=dtype)
+                vision_mask = torch.zeros((B, 0), device=device, dtype=torch.long)
+
+
+
             if args.toy_vision_signal:
                 # 让 harmful 样本“看起来更敏感”，使 gate 在 toy 数据上有可学信号
                 strength = (0.2 + 0.8 * is_harmful.float()).view(B, 1, 1).to(device=device,dtype=dtype)  # benign=0.2, harmful=1.0

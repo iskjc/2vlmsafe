@@ -36,6 +36,7 @@ class InputBuilder:
         vision_embeds: torch.Tensor,
         learnable_embeds: torch.Tensor,
         text_input_ids: torch.Tensor,
+        vision_attention_mask: Optional[torch.Tensor] = None,
         text_attention_mask: Optional[torch.Tensor] = None,
     ) -> BuiltInputs:
         if vision_embeds.ndim != 3:
@@ -82,6 +83,22 @@ class InputBuilder:
         text_embeds = self.text_embedding(text_input_ids.to(model_device)).to(dtype=dtype)
         text_len = text_embeds.shape[1]
 
+        if vision_attention_mask is None:
+            vision_mask = torch.ones((batch_v, vision_len), device=device, dtype=torch.long)
+        else:
+            # FIX(local): support padded vision embeddings by passing explicit vision mask.
+            if vision_attention_mask.ndim != 2:
+                raise ValueError(
+                    "vision_attention_mask must be rank-2 [B,V], "
+                    f"got shape {tuple(vision_attention_mask.shape)}"
+                )
+            if vision_attention_mask.shape != (batch_v, vision_len):
+                raise ValueError(
+                    "vision_attention_mask shape mismatch: "
+                    f"expected {(batch_v, vision_len)}, got {tuple(vision_attention_mask.shape)}"
+                )
+            vision_mask = vision_attention_mask.to(device=device, dtype=torch.long)
+
         if text_attention_mask is None:
             text_attention_mask = torch.ones((batch_v, text_len), device=device, dtype=torch.long)
         else:
@@ -99,7 +116,6 @@ class InputBuilder:
         inputs_embeds = torch.cat([vision_embeds, learnable_embeds, text_embeds], dim=1)
         full_len = vision_len + plugin_len + text_len
 
-        vision_mask = torch.ones((batch_v, vision_len), device=device, dtype=torch.long)
         plugin_mask = torch.ones((batch_v, plugin_len), device=device, dtype=torch.long)
         attention_mask = torch.cat([vision_mask, plugin_mask, text_attention_mask], dim=1)
         position_ids = None
