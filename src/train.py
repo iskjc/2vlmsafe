@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 
 from transformers import AutoProcessor
-processor = AutoProcessor.from_pretrained(args.model_name)
 
 try:
     from src.models.learnable_tokens import LearnableTokens, LearnableTokensConfig
@@ -17,16 +16,16 @@ except ModuleNotFoundError:
     from models.learnable_tokens import LearnableTokens, LearnableTokensConfig
     from models.input_builder import InputBuilder
 
-from .datasets import build_toy_dataset, build_jsonl_dataset
-if args.data_path:
-    dataset = build_jsonl_dataset(args.data_path)
-else:
-    dataset = build_toy_dataset()
+try:
+    from src.data.datasets import build_toy_dataset, build_jsonl_dataset
+except ModuleNotFoundError:
+    from data.datasets import build_toy_dataset, build_jsonl_dataset
+
+
 def freeze_model(model: nn.Module) -> None:
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
-
 
 def import_transformers():
     try:
@@ -151,6 +150,8 @@ def main() -> None:
     ap.add_argument("--toy", action="store_true")#暂时保留
     args = ap.parse_args()
 
+    processor = AutoProcessor.from_pretrained(args.model_name)
+
     if args.n_plugin <= 0:
         raise SystemExit("--n_plugin must be > 0")
     if args.steps <= 0:
@@ -178,7 +179,7 @@ def main() -> None:
     lt = LearnableTokens(cfg).to(device=device,dtype=dtype)
     lt.initialize(model.get_input_embeddings())
 
-    # Gate（可选）
+    # Gate
     gate = None
     if args.use_gate:
         try:
@@ -208,7 +209,11 @@ def main() -> None:
         from data.datasets import build_toy_dataset
         from data.collate import collate_prompt_target_batch
 
-    ds = build_toy_dataset()
+    if args.data_path:
+        ds = build_jsonl_dataset(args.data_path)
+    else:
+        ds = build_toy_dataset()
+    
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
@@ -218,10 +223,31 @@ def main() -> None:
     )
 
     # Optimizer：只更新插件（+ gate）
-    params = [lt.emb]
+    params = list(lt.parameters())
     if gate is not None:
         params += list(gate.parameters())
-    optim = torch.optim.AdamW(params, lr=args.lr)
+
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+
+
+    def count_trainable(m):
+        total = sum(p.numel() for p in m.parameters())
+        trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        return total, trainable
+
+    # 解冻 plugin / gate
+    for p in lt.parameters():   # LearnableTokens（可学习 token）
+        p.requires_grad = True
+    if gate is not None:
+        for p in gate.parameters():
+            p.requires_grad = True
+
+    # 打印确认
+    print("Backbone trainable:", sum(p.requires_grad for p in model.parameters()))
+    print("LT total/trainable:", count_trainable(lt))
+
+    if gate is not None:
+        print("Gate total/trainable:", count_trainable(gate))
 
     model.train(False)
     lt.train(True)
@@ -244,9 +270,7 @@ def main() -> None:
         B, T = input_ids.shape
 
         # ----- 构造 vision_embeds（占位：接真 VLM 后用真实视觉特征替换） -----
-        V = vision_embeds.shape[1]
-        print("vision_embeds:", vision_embeds.shape)
-        print("hidden size:", hidden_size)
+        V = args.vision_tokens
         if V > 0:
             vision_embeds = torch.zeros((B, V, hidden_size), device=device, dtype=dtype)
             if args.toy_vision_signal:
@@ -255,6 +279,8 @@ def main() -> None:
                 vision_embeds = vision_embeds + strength * torch.randn_like(vision_embeds) * 0.1
         else:
             vision_embeds = torch.zeros((B, 0, hidden_size), device=device, dtype=dtype)
+        print("vision_embeds:", vision_embeds.shape)
+        print("hidden size:", hidden_size)
 
         # ----- Learnable embeds（可选 gate 缩放） -----
         learnable_embeds = lt(batch_size=B, device=device, dtype=dtype)    # [B, N, H]
@@ -301,7 +327,7 @@ def main() -> None:
         if is_harmful.any():
             loss_safe = ce_per_sample[is_harmful].mean()
         else:
-            loss_safe = torch.zeros((), device=device,dtype=dtype)
+            loss_safe = torch.zeros((), device=device,dtype=torch.float32)
 
         # Utility Loss：只在 benign 样本上做 KL(p_base || p_plugin)
         # baseline forward（N=0），注意对齐到 text 区间
@@ -334,13 +360,13 @@ def main() -> None:
         if benign.any():
             loss_util = kl_per_sample[benign].mean()
         else:
-            loss_util = torch.zeros((), device=device)
+            loss_util = torch.zeros((), device=device,dtype=torch.float32)
 
         # ----- Gate Loss：benign->0, harmful->1 -----
-        loss_gate = torch.zeros((), device=device, dtype=dtype)
+        loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
-            y = is_harmful.to(device=device, dtype=dtype)
-            loss_gate = F.binary_cross_entropy(gate_value.clamp(1e-6, 1 - 1e-6), y)
+            y = is_harmful.to(device=device, dtype=torch.float32)
+            loss_gate = F.binary_cross_entropy(gate_value.float.clamp(1e-6, 1 - 1e-6), y)
 
         # total
         loss = (
@@ -349,11 +375,24 @@ def main() -> None:
             + args.lambda_gate * loss_gate
         )
 
-        optim.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+
+        # 检查 backbone 永远没梯度
+        backbone_has_grad = any(p.grad is not None for p in model.parameters())
+        lt_has_grad = any(p.grad is not None for p in lt.parameters())
+        gate_has_grad = (gate is not None) and any(p.grad is not None for p in gate.parameters())
+
+        if step == 1:
+            print("backbone_has_grad:", backbone_has_grad)  # 必须 False
+            print("lt_has_grad:", lt_has_grad)              # 必须 True
+            if gate is not None:
+                print("gate_has_grad:", gate_has_grad)      # 必须 True
+
+        # 梯度裁剪
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
-        optim.step()
+        optimizer.step()
 
         if step % 20 == 0:
             msg = (
