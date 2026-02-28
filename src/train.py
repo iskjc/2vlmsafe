@@ -351,8 +351,8 @@ def main() -> None:
         # 只在 target token（labels!=-100）上做 KL
         text_mask = (labels_text != -100).float()  # [B, T]
         # KL( base || plug )：把 base 当 teacher（teacher，教师模型），plug 当 student（student，学生模型）
-        logp = F.log_softmax(plug_text_logits, dim=-1)
-        q = F.softmax(base_text_logits, dim=-1)
+        logp = F.log_softmax(plug_text_logits.float(), dim=-1)
+        q = F.softmax(base_text_logits.float(), dim=-1)
         kl_tok = F.kl_div(logp, q, reduction="none").sum(dim=-1)  # [B, T]
         kl_per_sample = (kl_tok * text_mask).sum(dim=1) / text_mask.sum(dim=1).clamp(min=1.0)
 
@@ -365,8 +365,8 @@ def main() -> None:
         # ----- Gate Loss：benign->0, harmful->1 -----
         loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
-            y = is_harmful.to(device=device, dtype=torch.float32)
-            loss_gate = F.binary_cross_entropy(gate_value.to(device=device, dtype=torch.float32).clamp(1e-6, 1 - 1e-6), y)
+            y = is_harmful.to(device=device, dtype=torch.float32).view(-1)
+            loss_gate = F.binary_cross_entropy(gate_value.view(-1).to(device=device, dtype=torch.float32).clamp(1e-6, 1 - 1e-6), y)
             #safe version:
             # loss_gate = F.binary_cross_entropy(gate_value.view(-1),y.view(-1))
 
