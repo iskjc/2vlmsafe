@@ -366,7 +366,9 @@ def main() -> None:
         loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
             y = is_harmful.to(device=device, dtype=torch.float32)
-            loss_gate = F.binary_cross_entropy(gate_value.float.clamp(1e-6, 1 - 1e-6), y)
+            loss_gate = F.binary_cross_entropy(gate_value.to(device=device, dtype=torch.float32).clamp(1e-6, 1 - 1e-6), y)
+            #safe version:
+            # loss_gate = F.binary_cross_entropy(gate_value.view(-1),y.view(-1))
 
         # total
         loss = (
