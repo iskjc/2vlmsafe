@@ -1,7 +1,7 @@
 from pathlib import Path
 import json, random
-
-src = Path(r"D:\SRJ_program\program&practice\2vlmsafe\data\vlguard\processed\vlguard_train.jsonl")
+repo_root = Path(__file__).resolve().parents[1] 
+src = repo_root / "data" / "vlguard" / "processed" / "vlguard_train.jsonl"
 out_train = src.parent / "vlguard_train_90.jsonl"
 out_val   = src.parent / "vlguard_val_10.jsonl"
 

@@ -17,9 +17,9 @@ except ModuleNotFoundError:
     from models.input_builder import InputBuilder
 
 try:
-    from src.data.datasets import build_toy_dataset, build_jsonl_dataset
+    from src.data.datasets import build_jsonl_dataset
 except ModuleNotFoundError:
-    from data.datasets import build_toy_dataset, build_jsonl_dataset
+    from data.datasets import build_jsonl_dataset
 
 
 def freeze_model(model: nn.Module) -> None:
@@ -155,16 +155,15 @@ def main() -> None:
     ap.add_argument("--gate_hidden", type=int, default=256)
     # 视觉 token（暂时用占位；接真 VLM 时替换 vision_embeds 构造）
     ap.add_argument("--vision_tokens", type=int, default=8)
-    # 仅用于 toy 数据演示 gate：给 harmful/benign 注入不同强度噪声，使 gate 有可学信号
-    ap.add_argument("--toy_vision_signal", action="store_true")
     ap.add_argument("--save_path", type=str, default="outputs/learnable_tokens.pt")
     ap.add_argument("--save_gate_path", type=str, default="outputs/gate.pt")
     ap.add_argument("--data_path", type=str, default="", help="Path to training data jsonl")
-    ap.add_argument("--toy", action="store_true")#暂时保留
     args = ap.parse_args()
 
+    min_pixels = 256 * 28 * 28
+    max_pixels = 512 * 28 * 28
     # FIX(local): ensure processor works with remote-code VLM checkpoints.
-    processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(args.model_name, min_pixels = 256 * 28 * 28,max_pixels = 512 * 28 * 28,trust_remote_code=True)
 
     if args.n_plugin <= 0:
         raise SystemExit("--n_plugin must be > 0")
@@ -186,9 +185,32 @@ def main() -> None:
         vl_cls=AutoModelForImageTextToText,
     )
     model = load_model(model_cls, args.model_name, dtype=dtype, device=device)
+    model.gradient_checkpointing_enable()
+    print("config type:", type(model.config))
+    print("config has hidden_size:", hasattr(model.config, "hidden_size"))
+    for k in ["text_config", "language_config", "llm_config"]:
+        sub = getattr(model.config, k, None)
+        print(k, "exists:", sub is not None, "hidden_size:", getattr(sub, "hidden_size", None))
+
     freeze_model(model)
 
-    hidden_size = model.config.hidden_size
+    def get_hidden_size(cfg) -> int:
+        if hasattr(cfg, "hidden_size"):
+            return int(cfg.hidden_size)
+
+        for sub_name in ["text_config", "language_config", "llm_config"]:
+            sub = getattr(cfg, sub_name, None)
+            if sub is not None and hasattr(sub, "hidden_size"):
+                return int(sub.hidden_size)
+
+        for sub_name in ["text_config", "language_config", "llm_config"]:
+            sub = getattr(cfg, sub_name, None)
+            if sub is not None and hasattr(sub, "d_model"):
+                return int(sub.d_model)
+        raise AttributeError(
+            f"Cannot find hidden size in config. Top-level keys: {list(getattr(cfg, 'to_dict', lambda: {})().keys())}"
+        )
+    hidden_size = get_hidden_size(model.config)
 
     # Learnable Tokens
     cfg = LearnableTokensConfig(
@@ -221,16 +243,15 @@ def main() -> None:
     builder = InputBuilder(model, plugin_len=args.n_plugin, use_position_ids=True)
     base_builder = InputBuilder(model, plugin_len=0, use_position_ids=True)
 
-    # Dataset / Loader（目前用 toy， 后面接真实 jailbreak/VQA 只要替换 build_dataset）
+    # Dataset / Loader
     try:
         from src.data.collate import collate_prompt_target_batch
     except ModuleNotFoundError:
         from data.collate import collate_prompt_target_batch
 
-    if args.data_path:
-        ds = build_jsonl_dataset(args.data_path)
-    else:
-        ds = build_toy_dataset()
+    if not args.data_path:
+        raise SystemExit("--data_path is required.")
+    ds = build_jsonl_dataset(args.data_path)
     
     loader = DataLoader(
         ds,
@@ -287,38 +308,65 @@ def main() -> None:
         is_harmful = batch["is_harmful"]        # [B]
         B, T = input_ids.shape
 
-        # ----- 构造 vision_embeds（占位：接真 VLM 后用真实视觉特征替换） -----
-        V = args.vision_tokens
-        if V > 0:
-            # 用真实视觉特征替换占位 zeros
-            if "pixel_values" in batch and "image_grid_thw" in batch and hasattr(model, "get_image_features"):
-                with torch.no_grad():
-                    feats = model.get_image_features(
-                        batch["pixel_values"].to(device=device),
-                        batch["image_grid_thw"].to(device=device),
-                    )  # tuple/list, each [V_i, H]
+        # ----- 构造 vision_embeds -----
+        has_vision_inputs = ("pixel_values" in batch and "image_grid_thw" in batch)
+        if has_vision_inputs and args.vision_tokens <= 0:
+            raise RuntimeError("Batch contains vision inputs, but --vision_tokens is <= 0.")
+        if has_vision_inputs and not hasattr(model, "get_image_features"):
+            raise RuntimeError("Batch contains vision inputs, but model has no get_image_features method.")
 
-                Vmax = max(x.shape[0] for x in feats)
+        if args.vision_tokens > 0 and has_vision_inputs and hasattr(model, "get_image_features"):
+            with torch.no_grad():
+                raw_feats = model.get_image_features(
+                    batch["pixel_values"].to(device=device),
+                    batch["image_grid_thw"].to(device=device),
+                )
+
+            # Qwen2.5-VL get_image_features returns BaseModelOutputWithPooling:
+            # - last_hidden_state: vision hidden dim (e.g. 1280)
+            # - pooler_output: merged features aligned to LLM hidden dim (e.g. 3584)
+            if hasattr(raw_feats, "pooler_output") and raw_feats.pooler_output is not None:
+                raw_feats = raw_feats.pooler_output
+            elif hasattr(raw_feats, "last_hidden_state"):
+                raw_feats = raw_feats.last_hidden_state
+
+            if isinstance(raw_feats, torch.Tensor):
+                if raw_feats.ndim == 2:
+                    raw_feats = raw_feats.unsqueeze(0)
+                if raw_feats.ndim != 3:
+                    raise RuntimeError(f"Unsupported tensor vision feature shape: {tuple(raw_feats.shape)}")
+                if raw_feats.shape[0] != B:
+                    raise RuntimeError(f"Vision batch mismatch: expected {B}, got {raw_feats.shape[0]}")
+                if raw_feats.shape[-1] != hidden_size:
+                    raise RuntimeError(
+                        f"Vision hidden mismatch: {raw_feats.shape[-1]} vs model hidden={hidden_size}"
+                    )
+                vision_embeds = raw_feats.to(device=device, dtype=dtype)
+                Vmax = int(vision_embeds.shape[1])
+                vision_mask = torch.ones((B, Vmax), device=device, dtype=torch.long)
+            elif isinstance(raw_feats, (tuple, list)):
+                if len(raw_feats) != B:
+                    raise RuntimeError(f"Vision feature count mismatch: expected {B}, got {len(raw_feats)}")
+                Vmax = max((int(x.shape[0]) for x in raw_feats), default=0)
                 vision_embeds = torch.zeros((B, Vmax, hidden_size), device=device, dtype=dtype)
                 vision_mask = torch.zeros((B, Vmax), device=device, dtype=torch.long)
-                for i, x in enumerate(feats):
-                    v = x.shape[0]
-                    vision_embeds[i, :v] = x.to(device=device, dtype=dtype)
-                    vision_mask[i, :v] = 1
+                for i, x in enumerate(raw_feats):
+                    if x.ndim != 2:
+                        raise RuntimeError(f"Each vision feature must be [V,H], got {tuple(x.shape)}")
+                    v_i, h_i = x.shape
+                    if h_i != hidden_size:
+                        raise RuntimeError(
+                            f"Vision hidden mismatch at sample {i}: {h_i} vs model hidden={hidden_size}"
+                        )
+                    if v_i > 0:
+                        vision_embeds[i, :v_i] = x.to(device=device, dtype=dtype)
+                        vision_mask[i, :v_i] = 1
             else:
-                vision_embeds = torch.zeros((B, 0, hidden_size), device=device, dtype=dtype)
-                vision_mask = torch.zeros((B, 0), device=device, dtype=torch.long)
-
-
-
-            if args.toy_vision_signal:
-                # 让 harmful 样本“看起来更敏感”，使 gate 在 toy 数据上有可学信号
-                strength = (0.2 + 0.8 * is_harmful.float()).view(B, 1, 1).to(device=device,dtype=dtype)  # benign=0.2, harmful=1.0
-                vision_embeds = vision_embeds + strength * torch.randn_like(vision_embeds) * 0.1
+                raise RuntimeError(f"Unsupported vision feature type: {type(raw_feats)}")
         else:
             vision_embeds = torch.zeros((B, 0, hidden_size), device=device, dtype=dtype)
-        print("vision_embeds:", vision_embeds.shape)
-        print("hidden size:", hidden_size)
+            vision_mask = torch.zeros((B, 0), device=device, dtype=torch.long)
+
 
         # ----- Learnable embeds（可选 gate 缩放） -----
         learnable_embeds = lt(batch_size=B, device=device, dtype=dtype)    # [B, N, H]
@@ -331,15 +379,12 @@ def main() -> None:
             vision_embeds=vision_embeds,
             learnable_embeds=learnable_embeds,
             text_input_ids=input_ids,
+            vision_attention_mask=vision_mask,
             text_attention_mask=text_attn,
         )
 
+        V = int(vision_embeds.shape[1])
         N = args.n_plugin
-        L = V + N + T
-
-        # full labels: [B, V+N+T]
-        full_labels = torch.full((B, L), -100, device=device, dtype=torch.long)
-        full_labels[:, V + N : V + N + T] = labels_text
 
         # forward plugin（拿 logits 手算每类 loss，便于 harmful/benign 分开）
         out_plug = model(
@@ -347,18 +392,19 @@ def main() -> None:
             attention_mask=built.attention_mask,
             position_ids=built.position_ids,
         )
-        logits_plug = out_plug.logits  # [B, L, vocab]
+        logits_plug = out_plug.logits  # [B, V+N+T, vocab]
+        plug_text_logits = logits_plug[:, V + N : V + N + T, :]
 
         # ----- Safety Loss：只在 harmful 样本上算 CE -----
-        # token-level CE（reduction='none'）→ per-sample mean
+        # 仅在 text 区间计算 CE，避免对 vision/plugin 区间做无效大张量运算
         ce_tok = F.cross_entropy(
-            logits_plug.transpose(1, 2),
-            full_labels,
+            plug_text_logits.transpose(1, 2),
+            labels_text,
             ignore_index=-100,
             reduction="none",
-        )  # [B, L]
+        )  # [B, T]
 
-        mask_tok = (full_labels != -100).float()
+        mask_tok = (labels_text != -100).float()
         denom = mask_tok.sum(dim=1).clamp(min=1.0)
         ce_per_sample = (ce_tok * mask_tok).sum(dim=1) / denom
 
@@ -373,26 +419,38 @@ def main() -> None:
             vision_embeds=vision_embeds,
             learnable_embeds=torch.zeros((B, 0, hidden_size), device=device, dtype=dtype),
             text_input_ids=input_ids,
+            vision_attention_mask=vision_mask,
             text_attention_mask=text_attn,
         )
-        out_base = model(
-            inputs_embeds=base.inputs_embeds,
-            attention_mask=base.attention_mask,
-            position_ids=base.position_ids,
-        )
-        logits_base = out_base.logits  # [B, V+T, vocab]
+        with torch.no_grad():
+            out_base = model(
+                inputs_embeds=base.inputs_embeds,
+                attention_mask=base.attention_mask,
+                position_ids=base.position_ids,
+            )
+            logits_base = out_base.logits  # [B, V+T, vocab]
 
         # 取 text 区间 logits 对齐（不包含 vision/plugin）
-        plug_text_logits = logits_plug[:, V + N : V + N + T, :]
-        base_text_logits = logits_base[:, V : V + T, :].detach()
+        base_text_logits = logits_base[:, V : V + T, :]
 
         # 只在 target token（labels!=-100）上做 KL
         text_mask = (labels_text != -100).float()  # [B, T]
-        # KL( base || plug )：把 base 当 teacher（teacher，教师模型），plug 当 student（student，学生模型）
-        logp = F.log_softmax(plug_text_logits.float(), dim=-1)
-        q = F.softmax(base_text_logits.float(), dim=-1)
-        kl_tok = F.kl_div(logp, q, reduction="none").sum(dim=-1)  # [B, T]
-        kl_per_sample = (kl_tok * text_mask).sum(dim=1) / text_mask.sum(dim=1).clamp(min=1.0)
+        
+        kl_per_sample = []
+        for i in range(B):
+            # 每次只取一个 sample 的 logits 转换成 fp32 计算
+            lp_i = F.log_softmax(plug_text_logits[i:i+1].float(), dim=-1)
+            q_i = F.softmax(base_text_logits[i:i+1].float(), dim=-1)
+            
+            # 计算该 sample 的序列 KL
+            kl_i = F.kl_div(lp_i, q_i, reduction="none").sum(dim=-1) # [1, T]
+            
+            # 计算该 sample 均值并存入列表
+            sample_val = (kl_i * text_mask[i:i+1]).sum() / text_mask[i:i+1].sum().clamp(min=1.0)
+            kl_per_sample.append(sample_val)
+            
+        kl_per_sample = torch.stack(kl_per_sample)
+
 
         benign = ~is_harmful
         if benign.any():
@@ -404,7 +462,7 @@ def main() -> None:
         loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
             y = is_harmful.to(device=device, dtype=torch.float32).view(-1)
-            loss_gate = F.binary_cross_entropy(gate_value.view(-1).to(device=device, dtype=torch.float32).clamp(1e-6, 1 - 1e-6), y)
+            loss_gate = F.binary_cross_entropy_with_logits(gate_value.view(-1), y)
             #safe version:
             # loss_gate = F.binary_cross_entropy(gate_value.view(-1),y.view(-1))
 

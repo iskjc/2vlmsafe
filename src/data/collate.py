@@ -60,6 +60,12 @@ def collate_unified(
         batch_images = [im for im in images if im is not None]
         batch_data = adapter.encode(texts=full_texts, images=batch_images)
         prompt_data = adapter.encode_prompt(prompt_texts=prompt_texts, images=batch_images)
+        missing_vision_keys = [k for k in ("pixel_values", "image_grid_thw") if k not in batch_data]
+        if missing_vision_keys:
+            raise KeyError(
+                "Image batch encoded without required vision keys "
+                f"{missing_vision_keys}. Available keys: {list(batch_data.keys())}"
+            )
     else:
         batch_data = adapter.encode(texts=full_texts, images=None)
         prompt_data = adapter.encode_prompt(prompt_texts=prompt_texts, images=None)
@@ -80,10 +86,8 @@ def collate_unified(
     }
 
     if all_have:
-        if "pixel_values" in batch_data:
-            out["pixel_values"] = batch_data["pixel_values"]
-        if "image_grid_thw" in batch_data:
-            out["image_grid_thw"] = batch_data["image_grid_thw"]
+        out["pixel_values"] = batch_data["pixel_values"]
+        out["image_grid_thw"] = batch_data["image_grid_thw"]
 
     if device is not None:
         out = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in out.items()}

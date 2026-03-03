@@ -36,6 +36,7 @@ class VisionGate(nn.Module):
             nn.GELU(),
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.hidden_size, 1),
+            nn.Sigmoid()
         )
 
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
