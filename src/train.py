@@ -142,7 +142,7 @@ def main() -> None:
 
     # plug与训练超参
     ap.add_argument("--n_plugin", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=5e-3)
+    ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_clip", type=float, default=1.0)
@@ -160,10 +160,11 @@ def main() -> None:
     ap.add_argument("--data_path", type=str, default="", help="Path to training data jsonl")
     args = ap.parse_args()
 
+
     min_pixels = 256 * 28 * 28
     max_pixels = 512 * 28 * 28
     # FIX(local): ensure processor works with remote-code VLM checkpoints.
-    processor = AutoProcessor.from_pretrained(args.model_name, min_pixels = 256 * 28 * 28,max_pixels = 512 * 28 * 28,trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(args.model_name, min_pixels = min_pixels,max_pixels = max_pixels,trust_remote_code=True)
 
     if args.n_plugin <= 0:
         raise SystemExit("--n_plugin must be > 0")
@@ -186,6 +187,7 @@ def main() -> None:
     )
     model = load_model(model_cls, args.model_name, dtype=dtype, device=device)
     model.gradient_checkpointing_enable()
+
     print("config type:", type(model.config))
     print("config has hidden_size:", hasattr(model.config, "hidden_size"))
     for k in ["text_config", "language_config", "llm_config"]:
@@ -218,8 +220,17 @@ def main() -> None:
         hidden_size=hidden_size,
         init_from_token_id=tok.pad_token_id if tok.pad_token_id is not None else None,
     )
-    lt = LearnableTokens(cfg).to(device=device,dtype=dtype)
+    lt = LearnableTokens(cfg).to(device=device,dtype=torch.float32)
     lt.initialize(model.get_input_embeddings())
+
+
+    def chk(name, x):
+        if x is None: 
+            return
+        if not torch.isfinite(x).all():
+            bad = x[~torch.isfinite(x)]
+            raise RuntimeError(f"{name} has non-finite: {bad[:5]}")
+
 
     # Gate
     gate = None
@@ -237,11 +248,17 @@ def main() -> None:
                 min_scale=0.0,
                 max_scale=1.0,
             )
-        ).to(device=device, dtype=dtype)
+        ).to(device=device, dtype=torch.float32)
+
+
 
     # InputBuilders
     builder = InputBuilder(model, plugin_len=args.n_plugin, use_position_ids=True)
+
+
     base_builder = InputBuilder(model, plugin_len=0, use_position_ids=True)
+
+
 
     # Dataset / Loader
     try:
@@ -266,8 +283,15 @@ def main() -> None:
     if gate is not None:
         params += list(gate.parameters())
 
-    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+    lt_params = list(lt.parameters())
+    gate_params = list(gate.parameters()) if gate is not None else []
 
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": lt_params, "lr": args.lr, "weight_decay": 0.0},          # LT 不建议 weight_decay
+            {"params": gate_params, "lr": args.lr * 0.1, "weight_decay": 0.01}, # Gate 更小 lr
+        ]
+    )
 
     def count_trainable(m):
         total = sum(p.numel() for p in m.parameters())
@@ -288,6 +312,8 @@ def main() -> None:
     if gate is not None:
         print("Gate total/trainable:", count_trainable(gate))
 
+
+    #设置训练状态
     model.train(False)
     lt.train(True)
     if gate is not None:
@@ -369,10 +395,49 @@ def main() -> None:
 
 
         # ----- Learnable embeds（可选 gate 缩放） -----
-        learnable_embeds = lt(batch_size=B, device=device, dtype=dtype)    # [B, N, H]
+        
+        learnable_fp32 = lt(batch_size=B, device=device, dtype=torch.float32)  # LT 计算/输出 fp32
+        chk("learnable_embeds_pre_gate_fp32", learnable_fp32)
+
+        # 保险丝（在 fp32 上做）
+        learnable_fp32 = torch.nan_to_num(learnable_fp32, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-5, 5)
+        
+        # 给 backbone 用的版本（fp16）
+        learnable_embeds = learnable_fp32.to(dtype=dtype)
+
+
+        ###new add
+        learnable_embeds = torch.nan_to_num(learnable_embeds, nan=0.0, posinf=1e4, neginf=-1e4)
+        learnable_embeds = learnable_embeds.clamp(-5.0, 5.0)
+        ###
         gate_value = None
+        
+
         if gate is not None:
-            learnable_embeds, gate_value = gate.apply_to_embeddings(learnable_embeds, vision_embeds)  # gate_value: [B]
+            # 1) 用 fp32 做 gate（输入 + gate 参数都应该是 fp32，见下方提示）
+            learnable_fp32 = learnable_embeds.float()
+            vision_fp32 = vision_embeds.float()
+
+            learnable_fp32, gate_value = gate.apply_to_embeddings(learnable_fp32, vision_fp32)  # gate_value: [B] fp32
+            gate_value = gate_value.float()
+
+            # 2) 先检查 gate 输出是否正常（越早越好）
+            chk("gate_value", gate_value)
+            chk("learnable_embeds_post_gate_fp32", learnable_fp32)
+
+            # 3) 再加保险丝（建议对 fp32 的 learnable 先处理，再 cast 回 fp16）
+            learnable_fp32 = torch.nan_to_num(learnable_fp32, nan=0.0, posinf=1e4, neginf=-1e4)
+            learnable_fp32 = learnable_fp32.clamp(-5.0, 5.0)
+
+            # 4) 回到训练 dtype
+            learnable_embeds = learnable_fp32.to(dtype=dtype)
+
+            # 5) （可选）再检查一次回 fp16 后是否还正常
+            chk("learnable_embeds_post_gate", learnable_embeds)
+
+
+
+
 
         # ----- build plugin inputs -----
         built = builder.build(
@@ -386,14 +451,22 @@ def main() -> None:
         V = int(vision_embeds.shape[1])
         N = args.n_plugin
 
+        chk("built.inputs_embeds", built.inputs_embeds)
+        chk("built.attention_mask", built.attention_mask)
+        chk("built.position_ids", built.position_ids)
+
         # forward plugin（拿 logits 手算每类 loss，便于 harmful/benign 分开）
         out_plug = model(
             inputs_embeds=built.inputs_embeds,
             attention_mask=built.attention_mask,
             position_ids=built.position_ids,
+            use_cache=False,
         )
         logits_plug = out_plug.logits  # [B, V+N+T, vocab]
         plug_text_logits = logits_plug[:, V + N : V + N + T, :]
+
+        chk("logits_plug", logits_plug)
+
 
         # ----- Safety Loss：只在 harmful 样本上算 CE -----
         # 仅在 text 区间计算 CE，避免对 vision/plugin 区间做无效大张量运算
@@ -422,7 +495,7 @@ def main() -> None:
             vision_attention_mask=vision_mask,
             text_attention_mask=text_attn,
         )
-        with torch.no_grad():
+        with torch.inference_mode():
             out_base = model(
                 inputs_embeds=base.inputs_embeds,
                 attention_mask=base.attention_mask,
@@ -432,37 +505,46 @@ def main() -> None:
 
         # 取 text 区间 logits 对齐（不包含 vision/plugin）
         base_text_logits = logits_base[:, V : V + T, :]
+        plug_text_logits = plug_text_logits                      # [B, T, vocab]  (你已有)
 
         # 只在 target token（labels!=-100）上做 KL
-        text_mask = (labels_text != -100).float()  # [B, T]
-        
-        kl_per_sample = []
-        for i in range(B):
-            # 每次只取一个 sample 的 logits 转换成 fp32 计算
-            lp_i = F.log_softmax(plug_text_logits[i:i+1].float(), dim=-1)
-            q_i = F.softmax(base_text_logits[i:i+1].float(), dim=-1)
-            
-            # 计算该 sample 的序列 KL
-            kl_i = F.kl_div(lp_i, q_i, reduction="none").sum(dim=-1) # [1, T]
-            
-            # 计算该 sample 均值并存入列表
-            sample_val = (kl_i * text_mask[i:i+1]).sum() / text_mask[i:i+1].sum().clamp(min=1.0)
-            kl_per_sample.append(sample_val)
-            
-        kl_per_sample = torch.stack(kl_per_sample)
+        mask = (labels_text != -100)                              # [B, T] bool
+        if mask.any():
+            # 选出所有需要算 KL 的 token：形状变成 [N, vocab]
+            base_sel = base_text_logits[mask]                     # [N, vocab]
+            plug_sel = plug_text_logits[mask]                     # [N, vocab]
+
+            # teacher: base 的 log-prob（不需要梯度）
+            with torch.no_grad():
+                lq = F.log_softmax(base_sel, dim=-1)              # [N, vocab]
+
+            # student: plugin 的 log-prob（需要梯度）
+            lp = F.log_softmax(plug_sel, dim=-1)                  # [N, vocab]
+            # KL(q || p) = sum q * (log q - log p)
+            # F.kl_div 的约定：input=log p, target=log q 且 log_target=True
+            kl_tok = F.kl_div(lp, lq, log_target=True, reduction="none").sum(dim=-1)  # [N]
+
+            # 把 token 归回每个 sample：每个 token 属于哪个 batch
+            b_idx = mask.nonzero(as_tuple=False)[:, 0]            # [N]
+            kl_sum = torch.zeros((B,), device=device, dtype=kl_tok.dtype)
+            cnt = torch.zeros((B,), device=device, dtype=kl_tok.dtype)
+
+            kl_sum.scatter_add_(0, b_idx, kl_tok)
+            cnt.scatter_add_(0, b_idx, torch.ones_like(kl_tok))
+
+            kl_per_sample = kl_sum / cnt.clamp(min=1.0)           # [B]
+        else:
+            kl_per_sample = torch.zeros((B,), device=device, dtype=torch.float32)
 
 
         benign = ~is_harmful
-        if benign.any():
-            loss_util = kl_per_sample[benign].mean()
-        else:
-            loss_util = torch.zeros((), device=device,dtype=torch.float32)
+        loss_util = kl_per_sample[benign].mean() if benign.any() else torch.zeros((), device=device, dtype=torch.float32)
 
         # ----- Gate Loss：benign->0, harmful->1 -----
         loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
             y = is_harmful.to(device=device, dtype=torch.float32).view(-1)
-            loss_gate = F.binary_cross_entropy_with_logits(gate_value.view(-1), y)
+            loss_gate = F.binary_cross_entropy_with_logits(gate_value.view(-1), y.float())
             #safe version:
             # loss_gate = F.binary_cross_entropy(gate_value.view(-1),y.view(-1))
 
