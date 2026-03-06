@@ -76,7 +76,19 @@ def collate_unified(
     labels = input_ids.clone()
     for i in range(len(batch)):
         p_len = int(prompt_data["attention_mask"][i].sum().item())
-        labels[i, :p_len] = -100
+        full_len = int(attention_mask[i].sum().item())
+
+        # 防止 prompt 长度覆盖整条序列，至少保留 1 个可监督 token
+        if full_len > 0:
+            p_len = min(p_len, full_len - 1)
+        else:
+            p_len = 0
+
+    labels[i, :p_len] = -100
+    
+    if (labels[i] != -100).sum().item() == 0:
+        raise RuntimeError(f"No supervised tokens left at sample {i}.")
+
 
     out: Dict[str, Any] = {
         "input_ids": input_ids,
