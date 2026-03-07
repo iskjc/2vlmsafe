@@ -487,47 +487,45 @@ def main() -> None:
             vision_embeds = torch.zeros((B, 0, hidden_size), device=device, dtype=dtype)
             vision_mask = torch.zeros((B, 0), device=device, dtype=torch.long)
 
-
-        # ----- Learnable embeds（可选 gate 缩放） -----
-        
-        learnable_fp32 = lt(batch_size=B, device=device, dtype=torch.float32)  # LT 计算/输出 fp32
+        # ----- Learnable embeds（可选 gate 缩放）-----
+        learnable_fp32 = lt(batch_size=B, device=device, dtype=torch.float32)
         chk("learnable_embeds_pre_gate_fp32", learnable_fp32)
 
-        # 保险丝（在 fp32 上做）
-        learnable_fp32 = torch.nan_to_num(learnable_fp32, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-5, 5)
-        
-        # 给 backbone 用的版本（fp16）
-        learnable_embeds = learnable_fp32.to(dtype=dtype)
+        # 先清洗 LT 输出
+        learnable_fp32 = torch.nan_to_num(
+            learnable_fp32, nan=0.0, posinf=1e4, neginf=-1e4
+        ).clamp(-5.0, 5.0)
 
-
-        ###new add
-        learnable_embeds = torch.nan_to_num(learnable_embeds, nan=0.0, posinf=1e4, neginf=-1e4)
-        learnable_embeds = learnable_embeds.clamp(-5.0, 5.0)
-        ###
         gate_value = None
-        
 
         if gate is not None:
-            # 1) 用 fp32 做 gate（输入 + gate 参数都应该是 fp32，见下方提示）
-            learnable_fp32 = learnable_embeds.float()
-            vision_fp32 = vision_embeds.float()
+            # gate 前先确保输入干净
+            vision_fp32 = torch.nan_to_num(
+                vision_embeds.float(), nan=0.0, posinf=1e4, neginf=-1e4
+            ).clamp(-5.0, 5.0)
 
-            learnable_fp32, gate_value = gate.apply_to_embeddings(learnable_fp32, vision_fp32)  # gate_value: [B] fp32
+            learnable_fp32 = torch.nan_to_num(
+                learnable_fp32, nan=0.0, posinf=1e4, neginf=-1e4
+            ).clamp(-5.0, 5.0)
+
+            # 只调用一次
+            learnable_fp32, gate_value = gate.apply_to_embeddings(learnable_fp32, vision_fp32)
             gate_value = gate_value.float()
 
-            # 2) 先检查 gate 输出是否正常（越早越好）
+            # 检查 gate 输出
+            if torch.isnan(learnable_fp32).any():
+                print(f"Step {step}: NaN in learnable_fp32 after gate!")
+                learnable_fp32 = torch.nan_to_num(learnable_fp32, nan=0.0, posinf=1e4, neginf=-1e4)
+
+            if torch.isnan(gate_value).any():
+                print(f"Step {step}: NaN in gate_value!")
+                gate_value = torch.nan_to_num(gate_value, nan=0.5)
+
+            gate_value = torch.clamp(gate_value, 0.0, 1.0)
             chk("gate_value", gate_value)
-            chk("learnable_embeds_post_gate_fp32", learnable_fp32)
 
-            # 3) 再加保险丝（建议对 fp32 的 learnable 先处理，再 cast 回 fp16）
-            learnable_fp32 = torch.nan_to_num(learnable_fp32, nan=0.0, posinf=1e4, neginf=-1e4)
-            learnable_fp32 = learnable_fp32.clamp(-5.0, 5.0)
-
-            # 4) 回到训练 dtype
+            # 最后再转给 backbone
             learnable_embeds = learnable_fp32.to(dtype=dtype)
-
-            # 5) （可选）再检查一次回 fp16 后是否还正常
-            chk("learnable_embeds_post_gate", learnable_embeds)
 
 
         # ----- build plugin inputs -----
@@ -637,9 +635,19 @@ def main() -> None:
         loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
             y = is_harmful.to(device=device, dtype=torch.float32).view(-1)
-            loss_gate = F.binary_cross_entropy(gate_value.view(-1), y.float())
-            #safe version:
-            # loss_gate = F.binary_cross_entropy(gate_value.view(-1),y.view(-1))
+            if torch.isnan(gate_value).any():
+                print(f"Step {step}: Skipping gate loss due to NaN")
+                loss_gate = torch.zeros((), device=device, dtype=torch.float32)
+            else:
+                # 使用 label smoothing 避免过拟合
+                y_smooth = y * 0.9 + 0.05  # label smoothing
+                gate_clamped=torch.clamp(gate_value, min=1e-7, max=1-1e-7)
+                loss_gate = F.binary_cross_entropy(gate_clamped, y_smooth)
+                if torch.isnan(loss_gate):
+                    print(f"Step {step}: NaN in gate loss!")
+                    print(f"gate_value: {gate_value}")
+                    print(f"y: {y}")
+                    loss_gate = torch.zeros((), device=device, dtype=torch.float32)
 
         # total
         loss = (
@@ -666,6 +674,26 @@ def main() -> None:
 
 
         loss.backward()
+
+        # 检查 gate 梯度
+        if gate is not None:
+            for name, param in gate.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        print(f"Step {step}: NaN gradient in gate.{name}")
+                        param.grad = torch.nan_to_num(param.grad, nan=0.0)
+                    if torch.isinf(param.grad).any():
+                        print(f"Step {step}: Inf gradient in gate.{name}")
+                        param.grad = torch.nan_to_num(param.grad, posinf=1.0, neginf=-1.0)
+
+        # 梯度裁剪
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+
+
+
+
+
 
         # 检查 backbone 永远没梯度
         backbone_has_grad = any(p.grad is not None for p in model.parameters())

@@ -84,10 +84,10 @@ def collate_unified(
         else:
             p_len = 0
 
-    labels[i, :p_len] = -100
-    
-    if (labels[i] != -100).sum().item() == 0:
-        raise RuntimeError(f"No supervised tokens left at sample {i}.")
+        labels[i, :p_len] = -100
+
+        if (labels[i] != -100).sum().item() == 0:
+            raise RuntimeError(f"No supervised tokens left at sample {i}.")
 
 
     out: Dict[str, Any] = {

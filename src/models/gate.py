@@ -37,6 +37,8 @@ class VisionGate(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.Linear(cfg.hidden_size, 1)
         )
+        #用于数值稳定
+        self.eps=1e-7
 
     def forward(self, vision_features: torch.Tensor) -> torch.Tensor:
         if vision_features.ndim == 3:
@@ -53,11 +55,17 @@ class VisionGate(nn.Module):
             raise ValueError(
                 f"Expected feature dim {self.cfg.input_size}, got {pooled.shape[-1]}"
             )
+        
+        if torch.isnan(pooled).any():
+            print("Warning:Nan in vision_Features input to gate")
+            pooled=torch.nan_to_num(pooled, nan=0.0)
 
-        gate = torch.sigmoid(self.net(pooled))
+        gate_logits=self.net(pooled)
+        gate_logits=torch.clamp(gate_logits,-10,10)
+        gate = torch.sigmoid(gate_logits)
+        gate=torch.clamp(gate, self.eps,1.0-self.eps)
         scale = self.cfg.min_scale + (self.cfg.max_scale - self.cfg.min_scale) * gate
-        return scale.unsqueeze(-1)
-
+        return scale
     def apply_to_embeddings(
         self,
         learnable_embeds: torch.Tensor,
@@ -74,5 +82,7 @@ class VisionGate(nn.Module):
             raise ValueError(
                 f"Batch mismatch: gate batch={scale.shape[0]}, embeds batch={learnable_embeds.shape[0]}"
             )
-
-        return learnable_embeds * scale, scale.squeeze(-1).squeeze(-1)
+        scale_for_broadcast=scale.unsqueeze(1)
+        scale_embeds=learnable_embeds * scale_for_broadcast
+        scale_for_loss=scale.squeeze(-1)
+        return scale_embeds, scale_for_loss
