@@ -13,7 +13,7 @@ python src/train.py \
 --n_plugin 16 \
 --lr 5e-5 \
 --steps 200 \
---batch_size 1 \
+--batch_size 2 \
 --use_gate \
 --data_path data/vlguard/processed/vlguard_train.jsonl \
 --save_path outputs/learnable_tokens.pt \
