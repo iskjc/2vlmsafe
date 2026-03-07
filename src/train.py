@@ -1,9 +1,13 @@
 from __future__ import annotations
+
 import argparse
 import os
+
 import torch
 import torch.nn as nn
+
 from transformers import AutoProcessor
+
 try:
     from src.models.learnable_tokens import LearnableTokens, LearnableTokensConfig
     from src.models.input_builder import InputBuilder
@@ -11,67 +15,11 @@ except ModuleNotFoundError:
     # Support direct execution: `python src/train.py`
     from models.learnable_tokens import LearnableTokens, LearnableTokensConfig
     from models.input_builder import InputBuilder
+
 try:
     from src.data.datasets import build_jsonl_dataset
 except ModuleNotFoundError:
     from data.datasets import build_jsonl_dataset
-
-import random
-from torch.utils.data import Sampler
-
-class BalancedBatchSampler(Sampler[list[int]]):
-    """
-    每个 batch 强制包含 roughly 50/50 的 harmful/benign。
-    drop_last=True 时 batch 大小恒定
-    会自动过采样少数类
-    """
-    def __init__(self, labels, batch_size: int, seed: int = 0, drop_last: bool = True):
-        assert batch_size >= 2, "batch_size must be >= 2 for balanced sampling"
-        self.labels = [bool(x) for x in labels]
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.rng = random.Random(seed)
-
-        self.h_idx = [i for i, y in enumerate(self.labels) if y]
-        self.b_idx = [i for i, y in enumerate(self.labels) if not y]
-        if len(self.h_idx) == 0 or len(self.b_idx) == 0:
-            raise ValueError(f"Need both harmful and benign samples. got harmful={len(self.h_idx)}, benign={len(self.b_idx)}")
-
-        self.n_h = batch_size // 2
-        self.n_b = batch_size - self.n_h  # 处理奇数 batch_size
-
-        # 一个 epoch 产出多少 batch：按多数类估算
-        self.num_batches = (max(len(self.h_idx), len(self.b_idx)) // max(1, min(self.n_h, self.n_b)))
-        if self.num_batches <= 0:
-            self.num_batches = 1
-
-    def __len__(self):
-        return self.num_batches
-
-    def __iter__(self):
-        h = self.h_idx[:]
-        b = self.b_idx[:]
-        self.rng.shuffle(h)
-        self.rng.shuffle(b)
-
-        # 指针 + 过采样
-        hp = 0
-        bp = 0
-        for _ in range(self.num_batches):
-            batch = []
-            for _ in range(self.n_h):
-                if hp >= len(h):
-                    self.rng.shuffle(h)
-                    hp = 0
-                batch.append(h[hp]); hp += 1
-            for _ in range(self.n_b):
-                if bp >= len(b):
-                    self.rng.shuffle(b)
-                    bp = 0
-                batch.append(b[bp]); bp += 1
-
-            self.rng.shuffle(batch)
-            yield batch
 
 
 def freeze_model(model: nn.Module) -> None:
@@ -152,7 +100,7 @@ def load_model(
     dtype: torch.dtype,
     device: torch.device,
 ):
-    load_kwargs = {"torch_dtype": dtype}
+    load_kwargs = {"dtype": dtype}
 
     try:
         model = auto_model_cls.from_pretrained(model_name, use_safetensors=True, **load_kwargs)
@@ -199,9 +147,9 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     # Loss
-    ap.add_argument("--lambda_safe", type=float, default=0.02)
-    ap.add_argument("--lambda_util", type=float, default=0.2)
-    ap.add_argument("--lambda_gate", type=float, default=0.1)
+    ap.add_argument("--lambda_safe", type=float, default=1.0)
+    ap.add_argument("--lambda_util", type=float, default=1.0)
+    ap.add_argument("--lambda_gate", type=float, default=0.2)
     # Gate
     ap.add_argument("--use_gate", action="store_true")
     ap.add_argument("--gate_hidden", type=int, default=256)
@@ -210,20 +158,8 @@ def main() -> None:
     ap.add_argument("--save_path", type=str, default="outputs/learnable_tokens.pt")
     ap.add_argument("--save_gate_path", type=str, default="outputs/gate.pt")
     ap.add_argument("--data_path", type=str, default="", help="Path to training data jsonl")
-    ap.add_argument("--kl_cap", type=float, default=10.0, help="Cap per-token KL to stabilize training")
-    ap.add_argument(
-        "--balanced_sampling",
-        action="store_true",
-        default=True,
-        help="Use class-balanced batch sampling (requires --batch_size >= 2).",
-    )
-    ap.add_argument(
-        "--no_balanced_sampling",
-        action="store_false",
-        dest="balanced_sampling",
-        help="Disable class-balanced batch sampling.",
-    )
     args = ap.parse_args()
+
 
 
     min_pixels = 256 * 28 * 28
@@ -334,43 +270,14 @@ def main() -> None:
     if not args.data_path:
         raise SystemExit("--data_path is required.")
     ds = build_jsonl_dataset(args.data_path)
-
-    def get_is_harmful(sample):
-    # dict
-        if isinstance(sample, dict):
-            return bool(sample.get("is_harmful", False))
-        # object / dataclass
-        if hasattr(sample, "is_harmful"):
-            return bool(getattr(sample, "is_harmful"))
-        raise TypeError(f"Sample has no is_harmful field: type={type(sample)}")
     
-    print(f'ds:{len(ds)}')
-    
-    labels = [get_is_harmful(ds[i]) for i in range(len(ds))]
-    print("label stats:", sum(labels), "/", len(labels), "harmful")
-
-    if args.balanced_sampling and args.batch_size < 2:
-        print("Warning: --balanced_sampling requires --batch_size >= 2. Falling back to shuffle sampling.")
-        args.balanced_sampling = False
-
-    loader_kwargs = dict(
-        collate_fn=lambda b: collate_prompt_target_batch(
-            b, processor=processor, model_name=args.model_name, device=device, tokenizer=tok
-        ),
-        num_workers=0,  # 先保持0，后续再调
-        pin_memory=False,
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda b: collate_prompt_target_batch(b, processor=processor,model_name=args.model_name, device=device,tokenizer=tok),
+        drop_last=False,
     )
-
-    if args.balanced_sampling:
-        batch_sampler = BalancedBatchSampler(
-            labels=labels,
-            batch_size=args.batch_size,
-            seed=42,
-            drop_last=True,  # True保证每步都有同样数量 harmful/benign
-        )
-        loader = DataLoader(ds, batch_sampler=batch_sampler, **loader_kwargs)
-    else:
-        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
 
     # Optimizer：只更新插件（+ gate）
     params = list(lt.parameters())
@@ -530,6 +437,9 @@ def main() -> None:
             chk("learnable_embeds_post_gate", learnable_embeds)
 
 
+
+
+
         # ----- build plugin inputs -----
         built = builder.build(
             vision_embeds=vision_embeds,
@@ -577,8 +487,6 @@ def main() -> None:
         else:
             loss_safe = torch.zeros((), device=device,dtype=torch.float32)
 
-
-
         # Utility Loss：只在 benign 样本上做 KL(p_base || p_plugin)
         # baseline forward（N=0），注意对齐到 text 区间
         base = base_builder.build(
@@ -616,7 +524,7 @@ def main() -> None:
             # KL(q || p) = sum q * (log q - log p)
             # F.kl_div 的约定：input=log p, target=log q 且 log_target=True
             kl_tok = F.kl_div(lp, lq, log_target=True, reduction="none").sum(dim=-1)  # [N]
-            kl_tok=kl_tok.clamp(max=args.kl_cap)
+
             # 把 token 归回每个 sample：每个 token 属于哪个 batch
             b_idx = mask.nonzero(as_tuple=False)[:, 0]            # [N]
             kl_sum = torch.zeros((B,), device=device, dtype=kl_tok.dtype)
@@ -637,7 +545,7 @@ def main() -> None:
         loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
             y = is_harmful.to(device=device, dtype=torch.float32).view(-1)
-            loss_gate = F.binary_cross_entropy(gate_value.view(-1), y.float())
+            loss_gate = F.binary_cross_entropy_with_logits(gate_value.view(-1), y.float())
             #safe version:
             # loss_gate = F.binary_cross_entropy(gate_value.view(-1),y.view(-1))
 
@@ -647,24 +555,8 @@ def main() -> None:
             + args.lambda_util * loss_util
             + args.lambda_gate * loss_gate
         )
-        if step % 100==0:
-            print("components:", loss_safe.item(), loss_util.item(), loss_gate.item(), "total:", loss.item())
 
         optimizer.zero_grad(set_to_none=True)
-
-        if step %100==0:
-            print(
-             "[dbg]",
-             "harmful:", int(batch["is_harmful"].sum().item()),
-             "ls:", float(loss_safe.detach().cpu()),
-             "lu:", float(loss_util.detach().cpu()),
-             "lg:", float(loss_gate.detach().cpu()),
-             "lam:", args.lambda_safe, args.lambda_util, args.lambda_gate,
-             "total:", float(loss.detach().cpu()),
-             "check_total_minus:", float((loss - (args.lambda_safe*loss_safe + args.lambda_util*loss_util + args.lambda_gate*loss_gate)).detach().cpu())
-            )
-
-
         loss.backward()
 
         # 检查 backbone 永远没梯度
@@ -683,7 +575,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
         optimizer.step()
 
-        if step % 100 == 0:
+        if step % 20 == 0:
             msg = (
                 f"step={step} loss={loss.item():.4f} "
                 f"safe={loss_safe.item():.4f} util={loss_util.item():.4f} gate={loss_gate.item():.4f} "
