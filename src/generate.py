@@ -243,25 +243,25 @@ def main() -> None:
         if args.toy_vision_signal and args.vision_tokens > 0:
             vision_embeds = vision_embeds + torch.randn_like(vision_embeds) * 0.1
 
-    base_builder = InputBuilder(model, plugin_len=0, use_position_ids=True)
-    base = base_builder.build(
-        vision_embeds=vision_embeds,
-        learnable_embeds=torch.zeros((batch_size, 0, hidden), device=device, dtype=dtype),
-        text_input_ids=input_ids,
-        vision_attention_mask=vision_mask,
-        text_attention_mask=text.attention_mask,
-    )
-    print("[shapes]", base.inputs_embeds.shape, base.attention_mask.shape, base.position_ids.shape)
-    print("[pos head]", base.position_ids[0, :20].tolist())
-    print("[mask head]", base.attention_mask[0, :20].tolist())
-    base_out = model.generate(
-        inputs_embeds=base.inputs_embeds,
-        attention_mask=base.attention_mask,
-        position_ids=base.position_ids,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=False,
-    )
-    base_text = tok.decode(base_out[0], skip_special_tokens=True)
+    #base_builder = InputBuilder(model, plugin_len=0, use_position_ids=True)
+    #base = base_builder.build(
+    #    vision_embeds=vision_embeds,
+    #    learnable_embeds=torch.zeros((batch_size, 0, hidden), device=device, dtype=dtype),
+    #    text_input_ids=input_ids,
+    #    vision_attention_mask=vision_mask,
+    #    text_attention_mask=text.attention_mask,
+    #)
+    #print("[shapes]", base.inputs_embeds.shape, base.attention_mask.shape, base.position_ids.shape)
+    #print("[pos head]", base.position_ids[0, :20].tolist())
+    #print("[mask head]", base.attention_mask[0, :20].tolist())
+    #base_out = model.generate(
+    #    inputs_embeds=base.inputs_embeds,
+    #    attention_mask=base.attention_mask,
+    #    position_ids=base.position_ids,
+    #    max_new_tokens=args.max_new_tokens,
+    #    do_sample=False,
+    #)
+    #base_text = tok.decode(base_out[0], skip_special_tokens=True)
     # 先生成 learnable embeds
     learnable = lt(batch_size, device=device, dtype=dtype)
     gate_value = None
@@ -296,7 +296,7 @@ def main() -> None:
     )
     plug_text = tok.decode(plug_out[0], skip_special_tokens=True)
 
-    print("\n=== BASELINE ===\n", base_text)
+    #print("\n=== BASELINE ===\n", base_text)
     print("\n=== PLUGIN ===\n", plug_text)
 
 if __name__ == "__main__":

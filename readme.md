@@ -18,6 +18,6 @@ python src/train.py \
 --use_gate \
 --data_path data/vlguard/processed/vlguard_train.jsonl \
 --save_path outputs/learnable_tokens.pt \
---save_gate_path outputs/gate.pt
+--save_gate_path outputs/gate.pt\
 --balanced_sampling
 ```

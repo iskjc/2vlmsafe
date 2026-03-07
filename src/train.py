@@ -226,8 +226,8 @@ def main() -> None:
     args = ap.parse_args()
 
 
-    min_pixels = 256 * 28 * 28
-    max_pixels = 512 * 28 * 28
+    min_pixels = 128 * 28 * 28
+    max_pixels = 256 * 28 * 28
     # FIX(local): ensure processor works with remote-code VLM checkpoints.
     processor = AutoProcessor.from_pretrained(args.model_name, min_pixels = min_pixels,max_pixels = max_pixels,trust_remote_code=True)
 
@@ -441,7 +441,6 @@ def main() -> None:
                     batch["pixel_values"].to(device=device),
                     batch["image_grid_thw"].to(device=device),
                 )
-
             # Qwen2.5-VL get_image_features returns BaseModelOutputWithPooling:
             # - last_hidden_state: vision hidden dim (e.g. 1280)
             # - pooler_output: merged features aligned to LLM hidden dim (e.g. 3584)
@@ -449,6 +448,13 @@ def main() -> None:
                 raw_feats = raw_feats.pooler_output
             elif hasattr(raw_feats, "last_hidden_state"):
                 raw_feats = raw_feats.last_hidden_state
+
+                if isinstance(raw_feats, torch.Tensor):
+                    chk("raw_feats", raw_feats)
+                elif hasattr(raw_feats, "pooler_output") and raw_feats.pooler_output is not None:
+                    chk("raw_feats.pooler_output", raw_feats.pooler_output)
+                elif hasattr(raw_feats, "last_hidden_state"):
+                    chk("raw_feats.last_hidden_state", raw_feats.last_hidden_state)
 
             if isinstance(raw_feats, torch.Tensor):
                 if raw_feats.ndim == 2:
@@ -483,6 +489,7 @@ def main() -> None:
                         vision_mask[i, :v_i] = 1
             else:
                 raise RuntimeError(f"Unsupported vision feature type: {type(raw_feats)}")
+            chk("vision_embeds", vision_embeds)
         else:
             vision_embeds = torch.zeros((B, 0, hidden_size), device=device, dtype=dtype)
             vision_mask = torch.zeros((B, 0), device=device, dtype=torch.long)
@@ -579,58 +586,58 @@ def main() -> None:
 
         # Utility Loss：只在 benign 样本上做 KL(p_base || p_plugin)
         # baseline forward（N=0），注意对齐到 text 区间
-        base = base_builder.build(
-            vision_embeds=vision_embeds,
-            learnable_embeds=torch.zeros((B, 0, hidden_size), device=device, dtype=dtype),
-            text_input_ids=input_ids,
-            vision_attention_mask=vision_mask,
-            text_attention_mask=text_attn,
-        )
-        with torch.inference_mode():
-            out_base = model(
-                inputs_embeds=base.inputs_embeds,
-                attention_mask=base.attention_mask,
-                position_ids=base.position_ids,
-            )
-            logits_base = out_base.logits  # [B, V+T, vocab]
-
-        # 取 text 区间 logits 对齐（不包含 vision/plugin）
-        base_text_logits = logits_base[:, V : V + T, :]
-        plug_text_logits = plug_text_logits                      # [B, T, vocab]  (你已有)
-
-        # 只在 target token（labels!=-100）上做 KL
-        mask = (labels_text != -100)                              # [B, T] bool
-        if mask.any():
-            # 选出所有需要算 KL 的 token：形状变成 [N, vocab]
-            base_sel = base_text_logits[mask]                     # [N, vocab]
-            plug_sel = plug_text_logits[mask]                     # [N, vocab]
-
-            # teacher: base 的 log-prob（不需要梯度）
-            with torch.no_grad():
-                lq = F.log_softmax(base_sel, dim=-1)              # [N, vocab]
-
-            # student: plugin 的 log-prob（需要梯度）
-            lp = F.log_softmax(plug_sel, dim=-1)                  # [N, vocab]
-            # KL(q || p) = sum q * (log q - log p)
-            # F.kl_div 的约定：input=log p, target=log q 且 log_target=True
-            kl_tok = F.kl_div(lp, lq, log_target=True, reduction="none").sum(dim=-1)  # [N]
-            kl_tok=kl_tok.clamp(max=args.kl_cap)
-            # 把 token 归回每个 sample：每个 token 属于哪个 batch
-            b_idx = mask.nonzero(as_tuple=False)[:, 0]            # [N]
-            kl_sum = torch.zeros((B,), device=device, dtype=kl_tok.dtype)
-            cnt = torch.zeros((B,), device=device, dtype=kl_tok.dtype)
-
-            kl_sum.scatter_add_(0, b_idx, kl_tok)
-            cnt.scatter_add_(0, b_idx, torch.ones_like(kl_tok))
-
-            kl_per_sample = kl_sum / cnt.clamp(min=1.0)           # [B]
-        else:
-            kl_per_sample = torch.zeros((B,), device=device, dtype=torch.float32)
-
-
-        benign = ~is_harmful
-        loss_util = kl_per_sample[benign].mean() if benign.any() else torch.zeros((), device=device, dtype=torch.float32)
-
+        #base = base_builder.build(
+        #    vision_embeds=vision_embeds,
+        #    learnable_embeds=torch.zeros((B, 0, hidden_size), device=device, dtype=dtype),
+        #    text_input_ids=input_ids,
+        #    vision_attention_mask=vision_mask,
+        #    text_attention_mask=text_attn,
+        #)
+        #with torch.inference_mode():
+        #    out_base = model(
+        #        inputs_embeds=base.inputs_embeds,
+        #        attention_mask=base.attention_mask,
+        #        position_ids=base.position_ids,
+        #    )
+        #    logits_base = out_base.logits  # [B, V+T, vocab]
+#
+        ## 取 text 区间 logits 对齐（不包含 vision/plugin）
+        #base_text_logits = logits_base[:, V : V + T, :]
+        #plug_text_logits = plug_text_logits                      # [B, T, vocab]
+#
+        ## 只在 target token（labels!=-100）上做 KL
+        #mask = (labels_text != -100)                              # [B, T] bool
+        #if mask.any():
+        #    # 选出所有需要算 KL 的 token：形状变成 [N, vocab]
+        #    base_sel = base_text_logits[mask]                     # [N, vocab]
+        #    plug_sel = plug_text_logits[mask]                     # [N, vocab]
+#
+        #    # teacher: base 的 log-prob（不需要梯度）
+        #    with torch.no_grad():
+        #        lq = F.log_softmax(base_sel, dim=-1)              # [N, vocab]
+#
+        #    # student: plugin 的 log-prob（需要梯度）
+        #    lp = F.log_softmax(plug_sel, dim=-1)                  # [N, vocab]
+        #    # KL(q || p) = sum q * (log q - log p)
+        #    # F.kl_div 的约定：input=log p, target=log q 且 log_target=True
+        #    kl_tok = F.kl_div(lp, lq, log_target=True, reduction="none").sum(dim=-1)  # [N]
+        #    kl_tok=kl_tok.clamp(max=args.kl_cap)
+        #    # 把 token 归回每个 sample：每个 token 属于哪个 batch
+        #    b_idx = mask.nonzero(as_tuple=False)[:, 0]            # [N]
+        #    kl_sum = torch.zeros((B,), device=device, dtype=kl_tok.dtype)
+        #    cnt = torch.zeros((B,), device=device, dtype=kl_tok.dtype)
+#
+        #    kl_sum.scatter_add_(0, b_idx, kl_tok)
+        #    cnt.scatter_add_(0, b_idx, torch.ones_like(kl_tok))
+#
+        #    kl_per_sample = kl_sum / cnt.clamp(min=1.0)           # [B]
+        #else:
+        #    kl_per_sample = torch.zeros((B,), device=device, dtype=torch.float32)
+#
+#
+        #benign = ~is_harmful
+        #loss_util = kl_per_sample[benign].mean() if benign.any() else torch.zeros((), device=device, dtype=torch.float32)
+        loss_util = torch.zeros((), device=device, dtype=torch.float32)
         # ----- Gate Loss：benign->0, harmful->1 -----
         loss_gate = torch.zeros((), device=device, dtype=torch.float32)
         if gate_value is not None:
